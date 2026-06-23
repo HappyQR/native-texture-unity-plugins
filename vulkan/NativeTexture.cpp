@@ -31,6 +31,12 @@ namespace
 {
 constexpr int kBytesPerPixel = 4;
 constexpr int kJpegQuality = 90;
+// Event ID for the render-thread "drain pending uploads" callback fired from C#
+// via `GL.IssuePluginEvent(GetRenderEventFunc(), kEventIdSubmitUploads)`. The
+// event is registered with ConfigureEvent during device init so the callback
+// runs outside a render pass with graphics-queue access enabled, which is what
+// vkQueueSubmit on a transient transfer command buffer requires.
+constexpr int kEventIdSubmitUploads = 1;
 
 struct VulkanFunctions
 {
@@ -61,6 +67,7 @@ struct VulkanFunctions
     PFN_vkDestroyFence DestroyFence = nullptr;
     PFN_vkQueueSubmit QueueSubmit = nullptr;
     PFN_vkWaitForFences WaitForFences = nullptr;
+    PFN_vkGetFenceStatus GetFenceStatus = nullptr;
     PFN_vkQueueWaitIdle QueueWaitIdle = nullptr;
 };
 
@@ -90,17 +97,11 @@ struct QueueRequestState
     std::string error;
 };
 
-struct CreateTextureRequest
-{
-    QueueRequestState state;
-    VulkanContext context;
-    const unsigned char* rgba = nullptr;
-    int width = 0;
-    int height = 0;
-    bool useSrgb = false;
-    VkImage image = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-};
+// CreateTextureRequest and its render-thread callback (CreateTextureQueueCallback /
+// CreateTextureOnQueue) were the sync upload path before the worker/render-thread
+// split. Removed when CreateWithOptions switched to PrepareUploadOnWorker +
+// SubmitPendingUploadsCallback (Phase A + Phase B/C). Release path still uses
+// ReleaseTextureRequest because vkDestroyImage must run with queue access.
 
 struct ReleaseTextureRequest
 {
@@ -110,10 +111,62 @@ struct ReleaseTextureRequest
     VkDeviceMemory memory = VK_NULL_HANDLE;
 };
 
+// Phase A output (worker thread, no Vulkan command submission): VkImage + staging
+// buffer/memory created and populated, awaiting render-thread command submission.
+// The image is in VK_IMAGE_LAYOUT_UNDEFINED; the staging buffer holds the RGBA bytes
+// flushed from host memory.
+struct PendingUpload
+{
+    VulkanContext context;
+    VkImage image = VK_NULL_HANDLE;
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+
+// Phase B output (render thread, after vkQueueSubmit but before fence signal): the
+// VkImage now has commands in flight; staging buffer must stay alive until the fence
+// signals. Phase C scans this list each render-event tick and frees the staging
+// resources for fences that have signaled.
+struct InFlightUpload
+{
+    VulkanContext context;
+    VkImage image = VK_NULL_HANDLE;
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    VkCommandPool commandPool = VK_NULL_HANDLE;
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+};
+
+// A user-released texture awaiting fence-gated destruction. Release() enqueues these
+// (main thread, no GPU stall); the render-thread upload callback arms a graphics-queue
+// fence for each, then frees image+memory once that fence signals — proving the GPU has
+// retired Unity's last sampling/blit of the image. Replaces the old per-release
+// vkQueueWaitIdle(graphicsQueue) full-queue host stall.
+struct PendingDestroy
+{
+    VulkanContext context;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImage* externalImage = nullptr;
+    VkFence fence = VK_NULL_HANDLE;
+};
+
 using TextureKey = uint64_t;
 
 std::mutex gUnityStateMutex;
+std::mutex gQueueAccessMutex;
 std::mutex gTextureMutex;
+// Protects gPendingUploads + gInFlightUploads. Held briefly to push/take entries;
+// never held across Vulkan command recording / submission (those can be slow on
+// device-busy frames and would block the worker thread that's about to enqueue
+// the NEXT pending upload).
+std::mutex gUploadsMutex;
+std::vector<PendingUpload> gPendingUploads;
+std::vector<InFlightUpload> gInFlightUploads;
+std::vector<PendingDestroy> gPendingDestroys;
 #ifndef STBI_THREAD_LOCAL
 std::mutex gStbiLoadMutex;
 #endif
@@ -129,6 +182,9 @@ bool ExecuteQueueRequest(QueueRequestState& state,
                          UnityRenderingEventAndData callback,
                          void* userData);
 void UNITY_INTERFACE_API ReleaseTextureQueueCallback(int eventId, void* userData);
+void EnqueuePendingDestroy(const VulkanContext& context, const VulkanTextureResource& resource);
+void ProcessPendingDestroys();
+void FlushPendingDestroysBlocking();
 
 struct ScopedStbiLoadFlip
 {
@@ -360,6 +416,7 @@ bool LoadVulkanFunctions(const UnityVulkanInstance& instance, VulkanFunctions* o
     LOAD_DEVICE_FN(DestroyFence, vkDestroyFence);
     LOAD_DEVICE_FN(QueueSubmit, vkQueueSubmit);
     LOAD_DEVICE_FN(WaitForFences, vkWaitForFences);
+    LOAD_DEVICE_FN(GetFenceStatus, vkGetFenceStatus);
     LOAD_DEVICE_FN(QueueWaitIdle, vkQueueWaitIdle);
 
 #undef LOAD_DEVICE_FN
@@ -418,6 +475,28 @@ void RefreshVulkanContextLocked()
     gVulkanContext.valid = true;
     gVulkanContext.instance = instance;
     gVulkanContext.functions = functions;
+
+    // Register kEventIdSubmitUploads with Unity so that when C# fires
+    // `GL.IssuePluginEvent(GetRenderEventFunc(), kEventIdSubmitUploads)`, the
+    // render-thread callback (OnRenderEvent) runs with:
+    //  - kUnityVulkanRenderPass_EnsureOutside: render pass closed before the
+    //    callback so we can record image layout transitions + copy commands.
+    //  - kUnityVulkanGraphicsQueueAccess_Allow: callback can submit to the
+    //    graphics queue (vkQueueSubmit). Without this, the queue access is
+    //    blocked at the Unity side and our submit silently fails.
+    //  - kUnityVulkanEventConfigFlag_EnsurePreviousFrameSubmission: default;
+    //    waits for Unity's prior command-buffer submission before running our
+    //    callback so the render thread is at a known state.
+    // ConfigureEvent only works on V2; V1 will fall back to AccessQueue path
+    // for the rare device that doesn't expose V2.
+    if (gUnityGraphicsVulkanV2)
+    {
+        UnityVulkanPluginEventConfig eventConfig = {};
+        eventConfig.renderPassPrecondition = kUnityVulkanRenderPass_EnsureOutside;
+        eventConfig.graphicsQueueAccess = kUnityVulkanGraphicsQueueAccess_Allow;
+        eventConfig.flags = kUnityVulkanEventConfigFlag_EnsurePreviousFrameSubmission;
+        gUnityGraphicsVulkanV2->ConfigureEvent(kEventIdSubmitUploads, &eventConfig);
+    }
 }
 
 bool SnapshotVulkanContext(VulkanContext* outContext)
@@ -584,6 +663,7 @@ void UNITY_INTERFACE_API OnGraphicsDeviceEvent(UnityGfxDeviceEventType eventType
         case kUnityGfxDeviceEventBeforeReset:
         case kUnityGfxDeviceEventShutdown:
         {
+            FlushPendingDestroysBlocking();
             DrainOutstandingTextures("Graphics device shutdown", nullptr);
 
             std::lock_guard<std::mutex> lock(gUnityStateMutex);
@@ -651,175 +731,156 @@ bool FindMemoryType(const VulkanContext& context,
     return true;
 }
 
-bool CreateTextureOnQueue(CreateTextureRequest* request)
+// Phase A: runs on a Task.Run worker thread. Performs ONLY device-level Vulkan
+// operations that are thread-safe per spec (vkCreateImage / vkCreateBuffer /
+// vkAllocateMemory / vkBindXxxMemory / vkMapMemory / memcpy / vkUnmapMemory /
+// vkFlushMappedMemoryRanges). Returns a PendingUpload whose VkImage is in
+// VK_IMAGE_LAYOUT_UNDEFINED — the actual GPU upload command (barriers + copy +
+// barriers + submit) is queued by Phase B on the render thread.
+//
+// On failure, all partially-created Vulkan resources are destroyed in this same
+// function so the caller never sees a leak from a half-built upload.
+//
+// IMPORTANT: this function MUST NOT call vkQueueSubmit or any vkCmd* function.
+// Those operate on a command buffer / queue and must run on the render thread
+// (Vulkan spec + Unity's IUnityGraphicsVulkan constraint). Doing them here is
+// what caused the earlier SIGSEGV on Thread-6 (libunity.so) — two worker threads
+// racing on Unity's internal command buffer slots.
+//
+// outImageMemory is returned out-of-band so the caller (CreateWithOptions) can
+// register it on VulkanTextureResource for the eventual Release path. The staging
+// buffer/memory live on PendingUpload only — Phase C destroys them once the
+// fence signals.
+bool PrepareUploadOnWorker(const VulkanContext& context,
+                           const unsigned char* rgba,
+                           int width,
+                           int height,
+                           bool useSrgb,
+                           PendingUpload* outPending,
+                           VkDeviceMemory* outImageMemory,
+                           std::string* outError)
 {
-    const VulkanContext& context = request->context;
+    if (!outPending || !outImageMemory || !context.valid)
+    {
+        if (outError) *outError = "PrepareUploadOnWorker: invalid args / context";
+        return false;
+    }
+
     const VulkanFunctions& vk = context.functions;
     const VkDevice device = context.instance.device;
-
-    const VkDeviceSize imageSize = static_cast<VkDeviceSize>(request->width) *
-                                   static_cast<VkDeviceSize>(request->height) *
+    const VkDeviceSize imageSize = static_cast<VkDeviceSize>(width) *
+                                   static_cast<VkDeviceSize>(height) *
                                    static_cast<VkDeviceSize>(kBytesPerPixel);
 
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory imageMemory = VK_NULL_HANDLE;
     VkBuffer stagingBuffer = VK_NULL_HANDLE;
     VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
-    VkCommandPool commandPool = VK_NULL_HANDLE;
-    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-    VkFence fence = VK_NULL_HANDLE;
     VkMemoryPropertyFlags stagingFlags = 0;
 
     auto fail = [&](const char* action, VkResult result) -> bool
     {
-        request->state.error = std::string(action) + " failed with VkResult " + std::to_string(static_cast<int>(result));
+        if (outError)
+        {
+            *outError = std::string(action) + " failed with VkResult " +
+                        std::to_string(static_cast<int>(result));
+        }
+        if (stagingBuffer != VK_NULL_HANDLE) vk.DestroyBuffer(device, stagingBuffer, nullptr);
+        if (stagingMemory != VK_NULL_HANDLE) vk.FreeMemory(device, stagingMemory, nullptr);
+        if (image != VK_NULL_HANDLE) vk.DestroyImage(device, image, nullptr);
+        if (imageMemory != VK_NULL_HANDLE) vk.FreeMemory(device, imageMemory, nullptr);
         return false;
-    };
-
-    auto cleanup = [&]()
-    {
-        if (fence != VK_NULL_HANDLE)
-        {
-            vk.DestroyFence(device, fence, nullptr);
-            fence = VK_NULL_HANDLE;
-        }
-        if (commandBuffer != VK_NULL_HANDLE && commandPool != VK_NULL_HANDLE)
-        {
-            vk.FreeCommandBuffers(device, commandPool, 1, &commandBuffer);
-            commandBuffer = VK_NULL_HANDLE;
-        }
-        if (commandPool != VK_NULL_HANDLE)
-        {
-            vk.DestroyCommandPool(device, commandPool, nullptr);
-            commandPool = VK_NULL_HANDLE;
-        }
-        if (stagingBuffer != VK_NULL_HANDLE)
-        {
-            vk.DestroyBuffer(device, stagingBuffer, nullptr);
-            stagingBuffer = VK_NULL_HANDLE;
-        }
-        if (stagingMemory != VK_NULL_HANDLE)
-        {
-            vk.FreeMemory(device, stagingMemory, nullptr);
-            stagingMemory = VK_NULL_HANDLE;
-        }
     };
 
     VkImageCreateInfo imageInfo = {};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
-    imageInfo.format = request->useSrgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
-    imageInfo.extent.width = static_cast<uint32_t>(request->width);
-    imageInfo.extent.height = static_cast<uint32_t>(request->height);
+    imageInfo.format = useSrgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    imageInfo.extent.width = static_cast<uint32_t>(width);
+    imageInfo.extent.height = static_cast<uint32_t>(height);
     imageInfo.extent.depth = 1;
     imageInfo.mipLevels = 1;
     imageInfo.arrayLayers = 1;
     imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
     imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    // TRANSFER_SRC_BIT is required so Unity OpenXR Composition Layers (LocalTexture
+    // source mode) can copy the texture into the OpenXR-allocated swapchain image
+    // each frame via vkCmdCopyImage / vkCmdBlitImage. Without it, the composition
+    // layer's swapchain stays empty and the HD pano renders pure black on Quest;
+    // the failure is silent in release builds since validation layers are disabled.
+    imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                    | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                    | VK_IMAGE_USAGE_SAMPLED_BIT;
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     VkResult result = vk.CreateImage(device, &imageInfo, nullptr, &image);
-    if (result != VK_SUCCESS)
-    {
-        return fail("vkCreateImage", result);
-    }
+    if (result != VK_SUCCESS) return fail("vkCreateImage", result);
 
     VkMemoryRequirements imageRequirements = {};
     vk.GetImageMemoryRequirements(device, image, &imageRequirements);
 
     uint32_t imageMemoryTypeIndex = 0;
-    if (!FindMemoryType(context, imageRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &imageMemoryTypeIndex, nullptr))
+    if (!FindMemoryType(context, imageRequirements.memoryTypeBits,
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                        &imageMemoryTypeIndex, nullptr))
     {
-        request->state.error = "No compatible device-local Vulkan memory type for image";
-        vk.DestroyImage(device, image, nullptr);
-        return false;
+        if (outError) *outError = "No compatible device-local Vulkan memory type for image";
+        return fail("FindMemoryType(image)", VK_ERROR_OUT_OF_DEVICE_MEMORY);
     }
 
     VkMemoryAllocateInfo imageMemoryInfo = {};
     imageMemoryInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     imageMemoryInfo.allocationSize = imageRequirements.size;
     imageMemoryInfo.memoryTypeIndex = imageMemoryTypeIndex;
-
     result = vk.AllocateMemory(device, &imageMemoryInfo, nullptr, &imageMemory);
-    if (result != VK_SUCCESS)
-    {
-        vk.DestroyImage(device, image, nullptr);
-        return fail("vkAllocateMemory(image)", result);
-    }
+    if (result != VK_SUCCESS) return fail("vkAllocateMemory(image)", result);
 
     result = vk.BindImageMemory(device, image, imageMemory, 0);
-    if (result != VK_SUCCESS)
-    {
-        vk.FreeMemory(device, imageMemory, nullptr);
-        vk.DestroyImage(device, image, nullptr);
-        return fail("vkBindImageMemory", result);
-    }
+    if (result != VK_SUCCESS) return fail("vkBindImageMemory", result);
 
     VkBufferCreateInfo stagingBufferInfo = {};
     stagingBufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     stagingBufferInfo.size = imageSize;
     stagingBufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     stagingBufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
     result = vk.CreateBuffer(device, &stagingBufferInfo, nullptr, &stagingBuffer);
-    if (result != VK_SUCCESS)
-    {
-        vk.FreeMemory(device, imageMemory, nullptr);
-        vk.DestroyImage(device, image, nullptr);
-        return fail("vkCreateBuffer", result);
-    }
+    if (result != VK_SUCCESS) return fail("vkCreateBuffer", result);
 
     VkMemoryRequirements stagingRequirements = {};
     vk.GetBufferMemoryRequirements(device, stagingBuffer, &stagingRequirements);
 
     uint32_t stagingMemoryTypeIndex = 0;
-    if (!FindMemoryType(context, stagingRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &stagingMemoryTypeIndex, &stagingFlags))
+    if (!FindMemoryType(context, stagingRequirements.memoryTypeBits,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                        &stagingMemoryTypeIndex, &stagingFlags))
     {
-        cleanup();
-        vk.FreeMemory(device, imageMemory, nullptr);
-        vk.DestroyImage(device, image, nullptr);
-        request->state.error = "No compatible host-visible Vulkan memory type for staging buffer";
-        return false;
+        if (outError) *outError = "No compatible host-visible Vulkan memory type for staging buffer";
+        return fail("FindMemoryType(staging)", VK_ERROR_OUT_OF_HOST_MEMORY);
     }
 
     VkMemoryAllocateInfo stagingMemoryInfo = {};
     stagingMemoryInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     stagingMemoryInfo.allocationSize = stagingRequirements.size;
     stagingMemoryInfo.memoryTypeIndex = stagingMemoryTypeIndex;
-
     result = vk.AllocateMemory(device, &stagingMemoryInfo, nullptr, &stagingMemory);
-    if (result != VK_SUCCESS)
-    {
-        cleanup();
-        vk.FreeMemory(device, imageMemory, nullptr);
-        vk.DestroyImage(device, image, nullptr);
-        return fail("vkAllocateMemory(staging)", result);
-    }
+    if (result != VK_SUCCESS) return fail("vkAllocateMemory(staging)", result);
 
     result = vk.BindBufferMemory(device, stagingBuffer, stagingMemory, 0);
-    if (result != VK_SUCCESS)
-    {
-        cleanup();
-        vk.FreeMemory(device, imageMemory, nullptr);
-        vk.DestroyImage(device, image, nullptr);
-        return fail("vkBindBufferMemory", result);
-    }
+    if (result != VK_SUCCESS) return fail("vkBindBufferMemory", result);
 
+    // The big memcpy — this is the 3-9ms cost for a 4K pano. Doing it here on the
+    // worker thread (instead of inside the render-thread callback as the old code
+    // did) is the entire point of this refactor: render thread stays under 1ms
+    // for the actual command recording + submit.
     void* mappedMemory = nullptr;
     result = vk.MapMemory(device, stagingMemory, 0, imageSize, 0, &mappedMemory);
-    if (result != VK_SUCCESS)
-    {
-        cleanup();
-        vk.FreeMemory(device, imageMemory, nullptr);
-        vk.DestroyImage(device, image, nullptr);
-        return fail("vkMapMemory", result);
-    }
+    if (result != VK_SUCCESS) return fail("vkMapMemory", result);
 
-    std::memcpy(mappedMemory, request->rgba, static_cast<size_t>(imageSize));
+    std::memcpy(mappedMemory, rgba, static_cast<size_t>(imageSize));
+
     if ((stagingFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == 0)
     {
         VkMappedMemoryRange memoryRange = {};
@@ -831,179 +892,408 @@ bool CreateTextureOnQueue(CreateTextureRequest* request)
         if (result != VK_SUCCESS)
         {
             vk.UnmapMemory(device, stagingMemory);
-            cleanup();
-            vk.FreeMemory(device, imageMemory, nullptr);
-            vk.DestroyImage(device, image, nullptr);
             return fail("vkFlushMappedMemoryRanges", result);
         }
     }
     vk.UnmapMemory(device, stagingMemory);
 
-    VkCommandPoolCreateInfo commandPoolInfo = {};
-    commandPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    commandPoolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-    commandPoolInfo.queueFamilyIndex = context.instance.queueFamilyIndex;
-
-    result = vk.CreateCommandPool(device, &commandPoolInfo, nullptr, &commandPool);
-    if (result != VK_SUCCESS)
-    {
-        cleanup();
-        vk.FreeMemory(device, imageMemory, nullptr);
-        vk.DestroyImage(device, image, nullptr);
-        return fail("vkCreateCommandPool", result);
-    }
-
-    VkCommandBufferAllocateInfo commandBufferInfo = {};
-    commandBufferInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    commandBufferInfo.commandPool = commandPool;
-    commandBufferInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    commandBufferInfo.commandBufferCount = 1;
-
-    result = vk.AllocateCommandBuffers(device, &commandBufferInfo, &commandBuffer);
-    if (result != VK_SUCCESS)
-    {
-        cleanup();
-        vk.FreeMemory(device, imageMemory, nullptr);
-        vk.DestroyImage(device, image, nullptr);
-        return fail("vkAllocateCommandBuffers", result);
-    }
-
-    VkCommandBufferBeginInfo beginInfo = {};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-    result = vk.BeginCommandBuffer(commandBuffer, &beginInfo);
-    if (result != VK_SUCCESS)
-    {
-        cleanup();
-        vk.FreeMemory(device, imageMemory, nullptr);
-        vk.DestroyImage(device, image, nullptr);
-        return fail("vkBeginCommandBuffer", result);
-    }
-
-    VkImageMemoryBarrier uploadBarrier = {};
-    uploadBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    uploadBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    uploadBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    uploadBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    uploadBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    uploadBarrier.image = image;
-    uploadBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    uploadBarrier.subresourceRange.baseMipLevel = 0;
-    uploadBarrier.subresourceRange.levelCount = 1;
-    uploadBarrier.subresourceRange.baseArrayLayer = 0;
-    uploadBarrier.subresourceRange.layerCount = 1;
-    uploadBarrier.srcAccessMask = 0;
-    uploadBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-
-    vk.CmdPipelineBarrier(commandBuffer,
-                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                          VK_PIPELINE_STAGE_TRANSFER_BIT,
-                          0,
-                          0, nullptr,
-                          0, nullptr,
-                          1, &uploadBarrier);
-
-    VkBufferImageCopy copyRegion = {};
-    copyRegion.bufferOffset = 0;
-    copyRegion.bufferRowLength = 0;
-    copyRegion.bufferImageHeight = 0;
-    copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    copyRegion.imageSubresource.mipLevel = 0;
-    copyRegion.imageSubresource.baseArrayLayer = 0;
-    copyRegion.imageSubresource.layerCount = 1;
-    copyRegion.imageExtent.width = static_cast<uint32_t>(request->width);
-    copyRegion.imageExtent.height = static_cast<uint32_t>(request->height);
-    copyRegion.imageExtent.depth = 1;
-
-    vk.CmdCopyBufferToImage(commandBuffer,
-                            stagingBuffer,
-                            image,
-                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                            1,
-                            &copyRegion);
-
-    VkImageMemoryBarrier shaderReadBarrier = {};
-    shaderReadBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    shaderReadBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    shaderReadBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    shaderReadBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    shaderReadBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    shaderReadBarrier.image = image;
-    shaderReadBarrier.subresourceRange = uploadBarrier.subresourceRange;
-    shaderReadBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    shaderReadBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
-    vk.CmdPipelineBarrier(commandBuffer,
-                          VK_PIPELINE_STAGE_TRANSFER_BIT,
-                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                          0,
-                          0, nullptr,
-                          0, nullptr,
-                          1, &shaderReadBarrier);
-
-    result = vk.EndCommandBuffer(commandBuffer);
-    if (result != VK_SUCCESS)
-    {
-        cleanup();
-        vk.FreeMemory(device, imageMemory, nullptr);
-        vk.DestroyImage(device, image, nullptr);
-        return fail("vkEndCommandBuffer", result);
-    }
-
-    VkFenceCreateInfo fenceInfo = {};
-    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-
-    result = vk.CreateFence(device, &fenceInfo, nullptr, &fence);
-    if (result != VK_SUCCESS)
-    {
-        cleanup();
-        vk.FreeMemory(device, imageMemory, nullptr);
-        vk.DestroyImage(device, image, nullptr);
-        return fail("vkCreateFence", result);
-    }
-
-    VkSubmitInfo submitInfo = {};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &commandBuffer;
-
-    result = vk.QueueSubmit(context.instance.graphicsQueue, 1, &submitInfo, fence);
-    if (result != VK_SUCCESS)
-    {
-        cleanup();
-        vk.FreeMemory(device, imageMemory, nullptr);
-        vk.DestroyImage(device, image, nullptr);
-        return fail("vkQueueSubmit", result);
-    }
-
-    result = vk.WaitForFences(device, 1, &fence, VK_TRUE, std::numeric_limits<uint64_t>::max());
-    if (result != VK_SUCCESS)
-    {
-        cleanup();
-        vk.FreeMemory(device, imageMemory, nullptr);
-        vk.DestroyImage(device, image, nullptr);
-        return fail("vkWaitForFences", result);
-    }
-
-    cleanup();
-
-    request->image = image;
-    request->memory = imageMemory;
+    outPending->context = context;
+    outPending->image = image;
+    outPending->stagingBuffer = stagingBuffer;
+    outPending->stagingMemory = stagingMemory;
+    outPending->width = static_cast<uint32_t>(width);
+    outPending->height = static_cast<uint32_t>(height);
+    *outImageMemory = imageMemory;
     return true;
 }
 
-void UNITY_INTERFACE_API CreateTextureQueueCallback(int /*eventId*/, void* userData)
+// Phase C: called at the start of each Phase B run. Scans gInFlightUploads,
+// reaps entries whose fence has signaled, destroys their staging buffers / cmd
+// pools / fences. Non-blocking — uses vkGetFenceStatus, never vkWaitForFences.
+//
+// Caller MUST hold gUploadsMutex.
+void DrainCompletedInFlightsLocked()
 {
-    CreateTextureRequest* request = static_cast<CreateTextureRequest*>(userData);
-    if (!request)
+    for (auto it = gInFlightUploads.begin(); it != gInFlightUploads.end(); )
+    {
+        const VulkanFunctions& vk = it->context.functions;
+        const VkDevice device = it->context.instance.device;
+        VkResult fenceState = vk.GetFenceStatus(device, it->fence);
+        // VK_SUCCESS = signaled (GPU done). VK_NOT_READY = still running. Other =
+        // error (device lost etc) — treat as "give up, free anyway" since the
+        // device is already in a bad state and leaking would be worse.
+        if (fenceState == VK_NOT_READY)
+        {
+            ++it;
+            continue;
+        }
+        if (it->commandBuffer != VK_NULL_HANDLE && it->commandPool != VK_NULL_HANDLE)
+        {
+            vk.FreeCommandBuffers(device, it->commandPool, 1, &it->commandBuffer);
+        }
+        if (it->commandPool != VK_NULL_HANDLE) vk.DestroyCommandPool(device, it->commandPool, nullptr);
+        if (it->fence != VK_NULL_HANDLE)       vk.DestroyFence(device, it->fence, nullptr);
+        if (it->stagingBuffer != VK_NULL_HANDLE) vk.DestroyBuffer(device, it->stagingBuffer, nullptr);
+        if (it->stagingMemory != VK_NULL_HANDLE) vk.FreeMemory(device, it->stagingMemory, nullptr);
+        it = gInFlightUploads.erase(it);
+    }
+}
+
+// Wait synchronously for any in-flight uploads of `image` to finish, then free
+// their resources. Used by Release() to make vkDestroyImage safe even if a
+// Phase B submission is still mid-flight on the GPU.
+//
+// `image` is matched by handle — there should be at most ONE in-flight per image
+// (Phase A creates a fresh image per CreateAsync call).
+//
+// Caller MUST hold gUploadsMutex.
+void WaitAndFreeInFlightForImageLocked(VkImage image)
+{
+    for (auto it = gInFlightUploads.begin(); it != gInFlightUploads.end(); )
+    {
+        if (it->image != image)
+        {
+            ++it;
+            continue;
+        }
+        const VulkanFunctions& vk = it->context.functions;
+        const VkDevice device = it->context.instance.device;
+        if (it->fence != VK_NULL_HANDLE)
+        {
+            vk.WaitForFences(device, 1, &it->fence, VK_TRUE,
+                             std::numeric_limits<uint64_t>::max());
+        }
+        if (it->commandBuffer != VK_NULL_HANDLE && it->commandPool != VK_NULL_HANDLE)
+        {
+            vk.FreeCommandBuffers(device, it->commandPool, 1, &it->commandBuffer);
+        }
+        if (it->commandPool != VK_NULL_HANDLE) vk.DestroyCommandPool(device, it->commandPool, nullptr);
+        if (it->fence != VK_NULL_HANDLE)       vk.DestroyFence(device, it->fence, nullptr);
+        if (it->stagingBuffer != VK_NULL_HANDLE) vk.DestroyBuffer(device, it->stagingBuffer, nullptr);
+        if (it->stagingMemory != VK_NULL_HANDLE) vk.FreeMemory(device, it->stagingMemory, nullptr);
+        it = gInFlightUploads.erase(it);
+    }
+}
+
+// Enqueue a released texture for fence-gated destruction. Called from Release() on the
+// main thread — does NOT touch the GPU (no stall); the render-thread callback finishes
+// the job. The externalImage handle is freed only when the image is actually destroyed.
+void EnqueuePendingDestroy(const VulkanContext& context, const VulkanTextureResource& resource)
+{
+    PendingDestroy destroy = {};
+    destroy.context = context;
+    destroy.image = resource.image;
+    destroy.memory = resource.memory;
+    destroy.externalImage = resource.externalImage;
+    std::lock_guard<std::mutex> lock(gUploadsMutex);
+    gPendingDestroys.push_back(destroy);
+}
+
+// Render-thread only (called from SubmitPendingUploadsCallback, which runs with graphics-
+// queue access). Two-phase, NON-BLOCKING destruction:
+//   - Arm: a freshly-enqueued image (fence == NULL) gets a new fence submitted to the
+//     graphics queue with ZERO command buffers. Queue submissions execute in order, so
+//     this fence signals only after every prior submission — including Unity's last
+//     sampling / blit of this image — has retired on the GPU.
+//   - Reap: once vkGetFenceStatus reports the fence signaled, vkDestroyImage / vkFreeMemory
+//     are provably safe. No vkQueueWaitIdle, no host-side full-queue stall.
+// gUploadsMutex is held only to move entries in/out of the shared vector, never across the
+// vkQueueSubmit (mirrors the existing uploads-queue discipline).
+void ProcessPendingDestroys()
+{
+    std::vector<PendingDestroy> work;
+    {
+        std::lock_guard<std::mutex> lock(gUploadsMutex);
+        work.swap(gPendingDestroys);
+    }
+    if (work.empty())
     {
         return;
     }
 
-    const bool success = CreateTextureOnQueue(request);
-    CompleteRequest(request->state, success, request->state.error);
+    std::vector<PendingDestroy> stillPending;
+    for (PendingDestroy& destroy : work)
+    {
+        if (!destroy.context.valid)
+        {
+            // Device gone — leak the VkImage rather than risk UB; drop the wrapper.
+            delete destroy.externalImage;
+            continue;
+        }
+        const VulkanFunctions& vk = destroy.context.functions;
+        const VkDevice device = destroy.context.instance.device;
+        const VkQueue queue = destroy.context.instance.graphicsQueue;
+
+        auto destroyNow = [&]()
+        {
+            if (destroy.image != VK_NULL_HANDLE) vk.DestroyImage(device, destroy.image, nullptr);
+            if (destroy.memory != VK_NULL_HANDLE) vk.FreeMemory(device, destroy.memory, nullptr);
+            if (destroy.fence != VK_NULL_HANDLE) vk.DestroyFence(device, destroy.fence, nullptr);
+            delete destroy.externalImage;
+        };
+
+        if (destroy.fence == VK_NULL_HANDLE)
+        {
+            VkFenceCreateInfo fenceInfo = {};
+            fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            if (vk.CreateFence(device, &fenceInfo, nullptr, &destroy.fence) != VK_SUCCESS)
+            {
+                // Cannot arm — hard-wait once then destroy so we never free an in-use image.
+                if (queue != VK_NULL_HANDLE) vk.QueueWaitIdle(queue);
+                destroyNow();
+                continue;
+            }
+            VkSubmitInfo submitInfo = {};
+            submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submitInfo.commandBufferCount = 0;
+            if (vk.QueueSubmit(queue, 1, &submitInfo, destroy.fence) != VK_SUCCESS)
+            {
+                if (queue != VK_NULL_HANDLE) vk.QueueWaitIdle(queue);
+                destroyNow();
+                continue;
+            }
+            stillPending.push_back(destroy);
+            continue;
+        }
+
+        VkResult fenceState = vk.GetFenceStatus(device, destroy.fence);
+        if (fenceState == VK_NOT_READY)
+        {
+            stillPending.push_back(destroy);
+            continue;
+        }
+        // Signaled (GPU done) or an error (device lost — free anyway): safe to destroy.
+        destroyNow();
+    }
+
+    if (!stillPending.empty())
+    {
+        std::lock_guard<std::mutex> lock(gUploadsMutex);
+        for (PendingDestroy& destroy : stillPending)
+        {
+            gPendingDestroys.push_back(destroy);
+        }
+    }
 }
+
+// Shutdown / device-loss flush: blocking destruction of every still-pending entry. A host
+// stall is acceptable here (the session is tearing down). Must run with a live context.
+void FlushPendingDestroysBlocking()
+{
+    std::vector<PendingDestroy> work;
+    {
+        std::lock_guard<std::mutex> lock(gUploadsMutex);
+        work.swap(gPendingDestroys);
+    }
+    for (PendingDestroy& destroy : work)
+    {
+        if (destroy.context.valid)
+        {
+            const VulkanFunctions& vk = destroy.context.functions;
+            const VkDevice device = destroy.context.instance.device;
+            if (destroy.fence != VK_NULL_HANDLE)
+            {
+                vk.WaitForFences(device, 1, &destroy.fence, VK_TRUE, std::numeric_limits<uint64_t>::max());
+                vk.DestroyFence(device, destroy.fence, nullptr);
+            }
+            else if (destroy.context.instance.graphicsQueue != VK_NULL_HANDLE)
+            {
+                vk.QueueWaitIdle(destroy.context.instance.graphicsQueue);
+            }
+            if (destroy.image != VK_NULL_HANDLE) vk.DestroyImage(device, destroy.image, nullptr);
+            if (destroy.memory != VK_NULL_HANDLE) vk.FreeMemory(device, destroy.memory, nullptr);
+        }
+        delete destroy.externalImage;
+    }
+}
+
+// Phase B: render-thread callback fired via vulkanV2->AccessQueue(...). Drains
+// gPendingUploads, for each records vkCmdPipelineBarrier × 2 + vkCmdCopyBufferToImage
+// onto a transient command buffer and submits. The submit is FIRE-AND-FORGET:
+// the staging buffer + command pool + fence stay alive in gInFlightUploads until
+// DrainCompletedInFlightsLocked reaps them once the fence has signaled.
+//
+// Total render-thread cost per upload: <1ms (a few command records + one submit).
+// The slow staging memcpy ran on the worker; the GPU does the actual copy
+// asynchronously after submit returns.
+void UNITY_INTERFACE_API SubmitPendingUploadsCallback(int /*eventId*/, void* /*userData*/)
+{
+    // Advance fence-gated destruction of user-released textures first — this is the only
+    // place with graphics-queue access, and it must run even on ticks with no new uploads.
+    ProcessPendingDestroys();
+
+    std::vector<PendingUpload> drained;
+    {
+        std::lock_guard<std::mutex> lock(gUploadsMutex);
+        DrainCompletedInFlightsLocked();
+        if (gPendingUploads.empty())
+        {
+            return;
+        }
+        drained.swap(gPendingUploads);
+    }
+
+    for (PendingUpload& pending : drained)
+    {
+        const VulkanContext& context = pending.context;
+        if (!context.valid)
+        {
+            LogMessage("Warn", "SubmitPendingUploadsCallback skipped: invalid Vulkan context");
+            continue;
+        }
+        const VulkanFunctions& vk = context.functions;
+        const VkDevice device = context.instance.device;
+
+        VkCommandPool commandPool = VK_NULL_HANDLE;
+        VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+
+        auto cleanupTransient = [&]()
+        {
+            if (commandBuffer != VK_NULL_HANDLE && commandPool != VK_NULL_HANDLE)
+                vk.FreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+            if (commandPool != VK_NULL_HANDLE) vk.DestroyCommandPool(device, commandPool, nullptr);
+            if (fence != VK_NULL_HANDLE)       vk.DestroyFence(device, fence, nullptr);
+        };
+        auto cleanupAll = [&]()
+        {
+            cleanupTransient();
+            if (pending.stagingBuffer != VK_NULL_HANDLE) vk.DestroyBuffer(device, pending.stagingBuffer, nullptr);
+            if (pending.stagingMemory != VK_NULL_HANDLE) vk.FreeMemory(device, pending.stagingMemory, nullptr);
+        };
+
+        VkCommandPoolCreateInfo commandPoolInfo = {};
+        commandPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        commandPoolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+        commandPoolInfo.queueFamilyIndex = context.instance.queueFamilyIndex;
+        VkResult result = vk.CreateCommandPool(device, &commandPoolInfo, nullptr, &commandPool);
+        if (result != VK_SUCCESS)
+        {
+            LogMessage("Error", "SubmitPendingUploadsCallback: vkCreateCommandPool=%d", static_cast<int>(result));
+            cleanupAll();
+            continue;
+        }
+
+        VkCommandBufferAllocateInfo commandBufferInfo = {};
+        commandBufferInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        commandBufferInfo.commandPool = commandPool;
+        commandBufferInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        commandBufferInfo.commandBufferCount = 1;
+        result = vk.AllocateCommandBuffers(device, &commandBufferInfo, &commandBuffer);
+        if (result != VK_SUCCESS)
+        {
+            LogMessage("Error", "SubmitPendingUploadsCallback: vkAllocateCommandBuffers=%d", static_cast<int>(result));
+            cleanupAll();
+            continue;
+        }
+
+        VkCommandBufferBeginInfo beginInfo = {};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        result = vk.BeginCommandBuffer(commandBuffer, &beginInfo);
+        if (result != VK_SUCCESS)
+        {
+            LogMessage("Error", "SubmitPendingUploadsCallback: vkBeginCommandBuffer=%d", static_cast<int>(result));
+            cleanupAll();
+            continue;
+        }
+
+        VkImageMemoryBarrier uploadBarrier = {};
+        uploadBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        uploadBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        uploadBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        uploadBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        uploadBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        uploadBarrier.image = pending.image;
+        uploadBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        uploadBarrier.subresourceRange.baseMipLevel = 0;
+        uploadBarrier.subresourceRange.levelCount = 1;
+        uploadBarrier.subresourceRange.baseArrayLayer = 0;
+        uploadBarrier.subresourceRange.layerCount = 1;
+        uploadBarrier.srcAccessMask = 0;
+        uploadBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vk.CmdPipelineBarrier(commandBuffer,
+                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              0, 0, nullptr, 0, nullptr, 1, &uploadBarrier);
+
+        VkBufferImageCopy copyRegion = {};
+        copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copyRegion.imageSubresource.layerCount = 1;
+        copyRegion.imageExtent.width = pending.width;
+        copyRegion.imageExtent.height = pending.height;
+        copyRegion.imageExtent.depth = 1;
+        vk.CmdCopyBufferToImage(commandBuffer, pending.stagingBuffer, pending.image,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+
+        VkImageMemoryBarrier shaderReadBarrier = {};
+        shaderReadBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        shaderReadBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        shaderReadBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        shaderReadBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        shaderReadBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        shaderReadBarrier.image = pending.image;
+        shaderReadBarrier.subresourceRange = uploadBarrier.subresourceRange;
+        shaderReadBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        shaderReadBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vk.CmdPipelineBarrier(commandBuffer,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                              0, 0, nullptr, 0, nullptr, 1, &shaderReadBarrier);
+
+        result = vk.EndCommandBuffer(commandBuffer);
+        if (result != VK_SUCCESS)
+        {
+            LogMessage("Error", "SubmitPendingUploadsCallback: vkEndCommandBuffer=%d", static_cast<int>(result));
+            cleanupAll();
+            continue;
+        }
+
+        VkFenceCreateInfo fenceInfo = {};
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        result = vk.CreateFence(device, &fenceInfo, nullptr, &fence);
+        if (result != VK_SUCCESS)
+        {
+            LogMessage("Error", "SubmitPendingUploadsCallback: vkCreateFence=%d", static_cast<int>(result));
+            cleanupAll();
+            continue;
+        }
+
+        VkSubmitInfo submitInfo = {};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffer;
+        result = vk.QueueSubmit(context.instance.graphicsQueue, 1, &submitInfo, fence);
+        if (result != VK_SUCCESS)
+        {
+            LogMessage("Error", "SubmitPendingUploadsCallback: vkQueueSubmit=%d", static_cast<int>(result));
+            cleanupAll();
+            continue;
+        }
+
+        // Move to in-flight queue — the fence will signal when GPU finishes the
+        // copy + barriers. Phase C reaps these on subsequent callbacks.
+        InFlightUpload inflight = {};
+        inflight.context = context;
+        inflight.image = pending.image;
+        inflight.stagingBuffer = pending.stagingBuffer;
+        inflight.stagingMemory = pending.stagingMemory;
+        inflight.commandPool = commandPool;
+        inflight.commandBuffer = commandBuffer;
+        inflight.fence = fence;
+        {
+            std::lock_guard<std::mutex> lock(gUploadsMutex);
+            gInFlightUploads.push_back(inflight);
+        }
+        // Clear locals so cleanupTransient/cleanupAll wouldn't double-free if
+        // someone resurrects the lambda later. (Defensive — the cleanups aren't
+        // called after this point.)
+        commandPool = VK_NULL_HANDLE;
+        commandBuffer = VK_NULL_HANDLE;
+        fence = VK_NULL_HANDLE;
+    }
+}
+
 
 void UNITY_INTERFACE_API ReleaseTextureQueueCallback(int /*eventId*/, void* userData)
 {
@@ -1041,6 +1331,8 @@ bool ExecuteQueueRequest(QueueRequestState& state,
                          UnityRenderingEventAndData callback,
                          void* userData)
 {
+    std::unique_lock<std::mutex> queueLock(gQueueAccessMutex);
+
     IUnityGraphicsVulkanV2* vulkanV2 = nullptr;
     IUnityGraphicsVulkan* vulkanV1 = nullptr;
     {
@@ -1154,6 +1446,20 @@ NATIVE_TEXTURE_API void* UNITY_INTERFACE_API Create(unsigned char* rgba, int wid
 
 NATIVE_TEXTURE_API void* UNITY_INTERFACE_API CreateWithOptions(unsigned char* rgba, int width, int height, bool useSrgb)
 {
+    // CALLED FROM: a Task.Run worker thread (NativeTextureVulkan.CreateAsync's
+    // inner Task.Run on the C# side). Does heavy Vulkan device-level work here
+    // (vkCreateImage / alloc / staging memcpy) on the worker, then queues a
+    // render-thread command-submission callback and returns the IntPtr handle
+    // synchronously. The actual GPU upload (vkCmdCopyBufferToImage + barriers)
+    // runs asynchronously on Unity's render thread; the staging buffer/cmd pool
+    // are reaped by DrainCompletedInFlightsLocked once the fence signals.
+    //
+    // Ordering guarantee: by the time the C# caller binds the returned
+    // Texture2D into a material / OpenXR composition layer (which queues a
+    // render-thread command), the AccessQueue submission we fire below is
+    // already at the head of Unity's render-thread event queue, so the upload
+    // commands serialize before any draw that samples the image. The user
+    // never sees an undefined-content frame.
     if (!ValidateImageArgs(rgba, width, height, "Create"))
     {
         return nullptr;
@@ -1165,41 +1471,39 @@ NATIVE_TEXTURE_API void* UNITY_INTERFACE_API CreateWithOptions(unsigned char* rg
         return nullptr;
     }
 
-    CreateTextureRequest request = {};
-    request.context = context;
-    request.rgba = rgba;
-    request.width = width;
-    request.height = height;
-    request.useSrgb = useSrgb;
-
-    if (!ExecuteQueueRequest(request.state, context, CreateTextureQueueCallback, &request))
+    // Phase A — Vulkan device-level ops on the worker thread (thread-safe per
+    // Vulkan spec). NO command buffer recording, NO queue submission here.
+    PendingUpload pending = {};
+    VkDeviceMemory imageMemory = VK_NULL_HANDLE;
+    std::string error;
+    if (!PrepareUploadOnWorker(context, rgba, width, height, useSrgb, &pending, &imageMemory, &error))
     {
-        LogMessage("Error", "Create failed: %s", request.state.error.empty() ? "unknown queue access error" : request.state.error.c_str());
+        LogMessage("Error", "Create failed (PrepareUploadOnWorker): %s",
+                   error.empty() ? "unknown" : error.c_str());
         return nullptr;
     }
 
-    VkImage* externalImage = new (std::nothrow) VkImage(request.image);
+    VkImage* externalImage = new (std::nothrow) VkImage(pending.image);
     if (!externalImage)
     {
-        ReleaseTextureRequest releaseRequest = {};
-        releaseRequest.context = context;
-        releaseRequest.image = request.image;
-        releaseRequest.memory = request.memory;
-
-        if (!ExecuteQueueRequest(releaseRequest.state, context, ReleaseTextureQueueCallback, &releaseRequest))
-        {
-            LogMessage("Error", "Create cleanup failed after handle allocation failure: %s",
-                       releaseRequest.state.error.empty() ? "unknown queue access error" : releaseRequest.state.error.c_str());
-        }
-
+        // Phase A succeeded but we couldn't allocate the handle slot. Free
+        // everything Phase A created — staging + image + memory — then bail.
+        const VulkanFunctions& vk = context.functions;
+        const VkDevice device = context.instance.device;
+        if (pending.stagingBuffer != VK_NULL_HANDLE) vk.DestroyBuffer(device, pending.stagingBuffer, nullptr);
+        if (pending.stagingMemory != VK_NULL_HANDLE) vk.FreeMemory(device, pending.stagingMemory, nullptr);
+        if (pending.image != VK_NULL_HANDLE) vk.DestroyImage(device, pending.image, nullptr);
+        if (imageMemory != VK_NULL_HANDLE) vk.FreeMemory(device, imageMemory, nullptr);
         LogMessage("Error", "Create failed: unable to allocate external VkImage handle");
         return nullptr;
     }
 
+    // Register for Release() — `memory` is the image's device-local memory,
+    // NOT the staging memory (staging is reaped separately by Phase C).
     VulkanTextureResource resource = {};
     resource.externalImage = externalImage;
-    resource.image = request.image;
-    resource.memory = request.memory;
+    resource.image = pending.image;
+    resource.memory = imageMemory;
     resource.context = context;
     resource.width = static_cast<uint32_t>(width);
     resource.height = static_cast<uint32_t>(height);
@@ -1210,6 +1514,20 @@ NATIVE_TEXTURE_API void* UNITY_INTERFACE_API CreateWithOptions(unsigned char* rg
         gTextureResources[key] = resource;
     }
 
+    // Push Phase A output to the render-thread work queue. The C# layer (on
+    // Unity's main thread) will fire `GL.IssuePluginEvent(GetRenderEventFunc(),
+    // kEventIdSubmitUploads)` immediately after wrapping the returned
+    // `externalImage` IntPtr in a Texture2D; that IssuePluginEvent queues the
+    // render-thread callback in order with subsequent main-thread render
+    // commands, so any draw that samples the texture will be processed by the
+    // render thread AFTER our upload barriers + copy + submit.
+    //
+    // We intentionally do NOT call vulkanV2->AccessQueue here. AccessQueue is
+    // not documented as safe to invoke from a Task.Run worker thread — only
+    // GL.IssuePluginEvent's main-thread API has the right semantics for this.
+    // Older revisions of this file did call AccessQueue from worker; removed.
+    std::lock_guard<std::mutex> lock(gUploadsMutex);
+    gPendingUploads.push_back(pending);
     return externalImage;
 }
 
@@ -1291,14 +1609,77 @@ NATIVE_TEXTURE_API void UNITY_INTERFACE_API Release(void* texPtr)
         gTextureResources.erase(iterator);
     }
 
-    VulkanContext context = {};
-    const VulkanContext* preferredContext = nullptr;
-    if (SnapshotVulkanContext(&context))
+    // If an upload for this image is still pending (Phase A done but Phase B
+    // not yet run) OR in-flight (Phase B submitted but fence not signaled),
+    // destroying the VkImage now would crash on Adreno (GPU still using it).
+    //
+    // - Pending: just remove from queue (no GPU work started) + free its
+    //   staging immediately, then proceed to destroy the image.
+    // - In-flight: wait for the fence synchronously (rare path; usually the
+    //   C# ReleaseScheduler defers Release by 1+ frames, by which point the
+    //   upload is long done and the fence has been reaped by Phase C).
     {
-        preferredContext = &context;
+        std::lock_guard<std::mutex> lock(gUploadsMutex);
+        for (auto it = gPendingUploads.begin(); it != gPendingUploads.end(); )
+        {
+            if (it->image == resource.image)
+            {
+                const VulkanFunctions& vk = it->context.functions;
+                const VkDevice device = it->context.instance.device;
+                if (it->stagingBuffer != VK_NULL_HANDLE) vk.DestroyBuffer(device, it->stagingBuffer, nullptr);
+                if (it->stagingMemory != VK_NULL_HANDLE) vk.FreeMemory(device, it->stagingMemory, nullptr);
+                it = gPendingUploads.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+        WaitAndFreeInFlightForImageLocked(resource.image);
     }
 
-    DestroyTextureResourceBestEffort(resource, preferredContext, "Release");
+    VulkanContext context = {};
+    if (SnapshotVulkanContext(&context) && context.valid)
+    {
+        // Deferred, fence-gated destruction: the actual vkDestroyImage runs on the render
+        // thread (SubmitPendingUploadsCallback → ProcessPendingDestroys) once a graphics-
+        // queue fence proves the GPU has retired Unity's last use of this image. No
+        // vkQueueWaitIdle here — the previous per-release full-queue host stall on Unity's
+        // primary graphics queue was a major frame-pacing and render-thread-stability cost
+        // (it fired on every pano release, e.g. twice per timeline switch). The pump runs on
+        // the next render event (every texture create fires one; shutdown flushes the rest).
+        EnqueuePendingDestroy(context, resource);
+    }
+    else
+    {
+        // No live Vulkan context (device tearing down) — best-effort direct destroy.
+        DestroyTextureResourceBestEffort(resource, nullptr, "Release");
+    }
+}
+
+// Render-thread event entry. Called by Unity from the render thread when C#
+// invokes `GL.IssuePluginEvent(GetRenderEventFunc(), eventID)`. Event IDs are
+// configured during device init (see RefreshVulkanContextLocked) so that
+// kEventIdSubmitUploads runs outside any render pass with graphics-queue
+// access enabled — both required for our barrier + copy + submit sequence.
+NATIVE_TEXTURE_API void UNITY_INTERFACE_API OnRenderEvent(int eventID)
+{
+    if (eventID == kEventIdSubmitUploads)
+    {
+        // SubmitPendingUploadsCallback's signature takes (int, void*) because
+        // historically it was wired through AccessQueue's UnityRenderingEvent-
+        // AndData type. The userData arg is unused; nullptr is safe.
+        SubmitPendingUploadsCallback(eventID, nullptr);
+    }
+}
+
+// Returns the function pointer that C# passes to GL.IssuePluginEvent. The
+// exposed function MUST have signature `void OnRenderEvent(int eventID)` —
+// no userData, no return value (UnityRenderingEvent typedef). Unity calls
+// this from the render thread between draw submissions.
+NATIVE_TEXTURE_API UnityRenderingEvent UNITY_INTERFACE_API GetRenderEventFunc()
+{
+    return OnRenderEvent;
 }
 
 NATIVE_TEXTURE_API void UNITY_INTERFACE_API UnityPluginLoad(IUnityInterfaces* unityInterfaces)
@@ -1328,6 +1709,7 @@ NATIVE_TEXTURE_API void UNITY_INTERFACE_API UnityPluginUnload()
         context = gVulkanContext;
     }
 
+    FlushPendingDestroysBlocking();
     DrainOutstandingTextures("Plugin unload", context.valid ? &context : nullptr);
 
     if (unityGraphics)

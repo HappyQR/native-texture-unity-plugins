@@ -19,6 +19,19 @@ namespace NativeTexture
         private static bool s_hasCachedGraphicsDeviceType;
         private static bool s_pluginLoaded;
 
+        // Earlier versions of this file held a SemaphoreSlim(1) here to serialize the
+        // native Create*WithOptions calls. That was a workaround for a Quest SIGSEGV
+        // in render-thread vkCmdBindVertexBuffers / vkCmdPipelineBarrier when two
+        // concurrent CreateAsync calls touched Unity's shared IUnityGraphicsVulkan
+        // queue access. The proper fix landed in the native plugin: Phase A (vkCreateImage
+        // + alloc + staging memcpy) now runs lock-free on worker threads (Vulkan device
+        // ops are thread-safe per spec), and the actual command-buffer recording + submit
+        // moved to the render thread via GL.IssuePluginEvent (see WrapNativeTextureAsync
+        // below + OnRenderEvent in NativeTexture.cpp). With that, two concurrent CreateAsync
+        // calls genuinely parallelize on the worker side — dual-load Now+Then no longer
+        // serializes through the gate. The "left-then-right" stutter the user reported
+        // was that gate.
+
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
         private static void CaptureMainThreadContext()
         {
@@ -434,7 +447,25 @@ namespace NativeTexture
                 Texture2D texture = await RunOnMainThreadAsync(() =>
                 {
                     EnsureVulkanBackendOnMainThread();
-                    return Texture2D.CreateExternalTexture(width, height, TextureFormat.RGBA32, false, linear, nativeTexture);
+                    Texture2D wrapped = Texture2D.CreateExternalTexture(width, height, TextureFormat.RGBA32, false, linear, nativeTexture);
+
+                    // Native CreateWithOptions only ran Phase A (vkCreateImage + alloc + staging
+                    // memcpy on the Task.Run worker thread). The actual GPU upload (vkCmd*
+                    // barriers + copy + vkQueueSubmit) is queued by Unity's render thread
+                    // when we fire this IssuePluginEvent. Two ordering guarantees this
+                    // gives us:
+                    //   1. GL.IssuePluginEvent must be called from Unity's main thread —
+                    //      RunOnMainThreadAsync above puts us there.
+                    //   2. The event is inserted into Unity's render command stream at the
+                    //      position of THIS call, ahead of any subsequent main-thread render
+                    //      commands (MaterialPropertyBlock.SetTexture, hdTextures.LeftTexture
+                    //      assignment, etc) that the caller will issue with this Texture2D.
+                    //      So the GPU upload commands execute before any draw that samples
+                    //      the image. The first frame the caller renders this texture is
+                    //      already valid — no black frame.
+                    GL.IssuePluginEvent(GetRenderEventFunc(), SubmitUploadsEventId);
+
+                    return wrapped;
                 }, cancellationToken).ConfigureAwait(false);
 
                 if (cancellationToken.IsCancellationRequested)
@@ -731,5 +762,16 @@ namespace NativeTexture
         [DllImport(PluginName, EntryPoint = "SaveToFile")]
         [return: MarshalAs(UnmanagedType.I1)]
         private static extern bool SaveToFile(string fileName, IntPtr rgba, int width, int height);
+
+        // Event ID matched in OnRenderEvent in NativeTexture.cpp. ConfigureEvent
+        // is registered on this ID during device init so the render-thread callback
+        // gets graphics-queue access and runs outside any active render pass.
+        private const int SubmitUploadsEventId = 1;
+
+        // Returns the function pointer that GL.IssuePluginEvent invokes on the render
+        // thread. C signature: `void OnRenderEvent(int eventID)`. The pointer is stable
+        // for the lifetime of the process — Unity caches it safely.
+        [DllImport(PluginName, EntryPoint = "GetRenderEventFunc")]
+        private static extern IntPtr GetRenderEventFunc();
     }
 }
