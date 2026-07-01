@@ -83,6 +83,10 @@ for abi in ${ANDROID_ABIS}; do
     -Wextra \
     -pthread \
     -static-libstdc++ \
+    -O2 \
+    -DNDEBUG \
+    -DSTBI_NEON \
+    -DSTBI_THREAD_LOCAL=thread_local \
     -o "${abi_output_dir}/libNativeTexture.so" \
     vulkan/NativeTexture.cpp \
     -I vulkan \

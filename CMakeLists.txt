@@ -133,6 +133,14 @@ elseif(NATIVE_TEXTURE_BACKEND STREQUAL "vulkan")
 
     native_texture_enable_warnings("${_native_texture_target}")
 
+    # stb_image decode is pure CPU (Huffman + IDCT); build optimized with NEON SIMD
+    # and thread-local flip state so concurrent tile decodes are not serialized.
+    target_compile_options("${_native_texture_target}" PRIVATE -O2)
+    target_compile_definitions("${_native_texture_target}" PRIVATE
+        NDEBUG
+        STBI_NEON
+        STBI_THREAD_LOCAL=thread_local)
+
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         target_link_options("${_native_texture_target}" PRIVATE -static-libstdc++)
     endif()
