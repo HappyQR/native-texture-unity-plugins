@@ -156,6 +156,60 @@ struct PendingDestroy
 
 using TextureKey = uint64_t;
 
+// ---- Pano GPU tile assembly (region-copy) -------------------------------
+// Replaces the CPU 134MB stitch buffer: each tile is decoded to a small (~1MB)
+// host-visible staging slot (row-reversed for the bottom-up flip), then ONE
+// batched vkCmdCopyBufferToImage per pano copies every tile region into a
+// persistent device image. Peak drops from ~4x134MB to ~2x134MB.
+
+// Reusable host-visible staging buffer. Returned to gStagingFreeList after the
+// batch's fence signals (never a full-size 134MB staging; no per-tile
+// vkAllocateMemory after warmup — P1-9).
+struct StagingSlot
+{
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize capacity = 0;   // vkCreateBuffer size — reuse requires need <= capacity
+    bool coherent = false;
+};
+
+// In-progress assembly: created by BeginPanoAssembly, appended by UploadTileRegion
+// (concurrent worker threads, guarded by gAssembliesMutex), finalized by
+// FinishPanoAssembly which moves it to gPendingAssemblies. The device image is
+// also registered in gTextureResources so Release() finds it.
+struct AssemblyImage
+{
+    VulkanContext context;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory imageMemory = VK_NULL_HANDLE;
+    VkImage* externalImage = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<VkBufferImageCopy> regions;
+    std::vector<StagingSlot> stagings;   // parallel to regions
+};
+
+// Committed assembly awaiting the render-thread batched submit (Phase B).
+struct PendingAssembly
+{
+    VulkanContext context;
+    VkImage image = VK_NULL_HANDLE;
+    std::vector<VkBufferImageCopy> regions;
+    std::vector<StagingSlot> stagings;
+};
+
+// Submitted assembly awaiting its fence. Its stagings return to the ring (not
+// destroyed) once the fence signals.
+struct InFlightAssembly
+{
+    VulkanContext context;
+    VkImage image = VK_NULL_HANDLE;
+    VkCommandPool commandPool = VK_NULL_HANDLE;
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    std::vector<StagingSlot> stagings;
+};
+
 std::mutex gUnityStateMutex;
 std::mutex gQueueAccessMutex;
 std::mutex gTextureMutex;
@@ -177,6 +231,17 @@ IUnityGraphicsVulkan* gUnityGraphicsVulkan = nullptr;
 VulkanContext gVulkanContext = {};
 std::unordered_map<TextureKey, VulkanTextureResource> gTextureResources;
 
+// Pano assembly state. gAssemblies is worker-thread only (Begin/Upload/Finish/
+// Abort), guarded by gAssembliesMutex. gPendingAssemblies / gInFlightAssemblies /
+// gStagingFreeList are shared with the render thread and guarded by gUploadsMutex
+// (same discipline as gPendingUploads). Lock order when both are held:
+// gTextureMutex -> gAssembliesMutex -> gUploadsMutex.
+std::mutex gAssembliesMutex;
+std::unordered_map<TextureKey, AssemblyImage> gAssemblies;
+std::vector<PendingAssembly> gPendingAssemblies;
+std::vector<InFlightAssembly> gInFlightAssemblies;
+std::vector<StagingSlot> gStagingFreeList;
+
 bool ExecuteQueueRequest(QueueRequestState& state,
                          const VulkanContext& context,
                          UnityRenderingEventAndData callback,
@@ -185,6 +250,11 @@ void UNITY_INTERFACE_API ReleaseTextureQueueCallback(int eventId, void* userData
 void EnqueuePendingDestroy(const VulkanContext& context, const VulkanTextureResource& resource);
 void ProcessPendingDestroys();
 void FlushPendingDestroysBlocking();
+void ReturnStagingSlotLocked(const StagingSlot& slot);
+void DestroyStagingSlotDirect(const VulkanContext& context, const StagingSlot& slot);
+void DrainCompletedAssembliesLocked();
+void SubmitPendingAssemblies();
+void DestroyAssemblyResourcesBlocking();
 
 struct ScopedStbiLoadFlip
 {
@@ -664,6 +734,7 @@ void UNITY_INTERFACE_API OnGraphicsDeviceEvent(UnityGfxDeviceEventType eventType
         case kUnityGfxDeviceEventShutdown:
         {
             FlushPendingDestroysBlocking();
+            DestroyAssemblyResourcesBlocking();
             DrainOutstandingTextures("Graphics device shutdown", nullptr);
 
             std::lock_guard<std::mutex> lock(gUnityStateMutex);
@@ -939,42 +1010,6 @@ void DrainCompletedInFlightsLocked()
     }
 }
 
-// Wait synchronously for any in-flight uploads of `image` to finish, then free
-// their resources. Used by Release() to make vkDestroyImage safe even if a
-// Phase B submission is still mid-flight on the GPU.
-//
-// `image` is matched by handle — there should be at most ONE in-flight per image
-// (Phase A creates a fresh image per CreateAsync call).
-//
-// Caller MUST hold gUploadsMutex.
-void WaitAndFreeInFlightForImageLocked(VkImage image)
-{
-    for (auto it = gInFlightUploads.begin(); it != gInFlightUploads.end(); )
-    {
-        if (it->image != image)
-        {
-            ++it;
-            continue;
-        }
-        const VulkanFunctions& vk = it->context.functions;
-        const VkDevice device = it->context.instance.device;
-        if (it->fence != VK_NULL_HANDLE)
-        {
-            vk.WaitForFences(device, 1, &it->fence, VK_TRUE,
-                             std::numeric_limits<uint64_t>::max());
-        }
-        if (it->commandBuffer != VK_NULL_HANDLE && it->commandPool != VK_NULL_HANDLE)
-        {
-            vk.FreeCommandBuffers(device, it->commandPool, 1, &it->commandBuffer);
-        }
-        if (it->commandPool != VK_NULL_HANDLE) vk.DestroyCommandPool(device, it->commandPool, nullptr);
-        if (it->fence != VK_NULL_HANDLE)       vk.DestroyFence(device, it->fence, nullptr);
-        if (it->stagingBuffer != VK_NULL_HANDLE) vk.DestroyBuffer(device, it->stagingBuffer, nullptr);
-        if (it->stagingMemory != VK_NULL_HANDLE) vk.FreeMemory(device, it->stagingMemory, nullptr);
-        it = gInFlightUploads.erase(it);
-    }
-}
-
 // Enqueue a released texture for fence-gated destruction. Called from Release() on the
 // main thread — does NOT touch the GPU (no stall); the render-thread callback finishes
 // the job. The externalImage handle is freed only when the image is actually destroyed.
@@ -1107,6 +1142,406 @@ void FlushPendingDestroysBlocking()
     }
 }
 
+// ---- Pano assembly helpers ----------------------------------------------
+
+// Round a tile staging need up to a 1 MiB granularity so all slots for 512x512
+// tiles are uniform (1 MiB) and fully interchangeable across full + edge tiles.
+VkDeviceSize RoundUpStaging(VkDeviceSize need)
+{
+    const VkDeviceSize granularity = static_cast<VkDeviceSize>(1) << 20;
+    return ((need + granularity - 1) / granularity) * granularity;
+}
+
+// Rent a host-visible staging buffer of at least `need` bytes. Reuses a free-list
+// slot when possible (capacity >= need); otherwise allocates a new one. Called on
+// worker threads — device-level ops only (thread-safe), no command work.
+bool AcquireStagingSlot(const VulkanContext& context, VkDeviceSize need, StagingSlot* out, std::string* outError)
+{
+    {
+        std::lock_guard<std::mutex> lock(gUploadsMutex);
+        for (auto it = gStagingFreeList.begin(); it != gStagingFreeList.end(); ++it)
+        {
+            if (it->capacity >= need)
+            {
+                *out = *it;
+                gStagingFreeList.erase(it);
+                return true;
+            }
+        }
+    }
+
+    const VulkanFunctions& vk = context.functions;
+    const VkDevice device = context.instance.device;
+    const VkDeviceSize size = RoundUpStaging(need);
+
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkMemoryPropertyFlags flags = 0;
+    auto fail = [&](const char* action, VkResult result) -> bool
+    {
+        if (outError)
+        {
+            *outError = std::string(action) + " failed with VkResult " + std::to_string(static_cast<int>(result));
+        }
+        if (buffer != VK_NULL_HANDLE) vk.DestroyBuffer(device, buffer, nullptr);
+        if (memory != VK_NULL_HANDLE) vk.FreeMemory(device, memory, nullptr);
+        return false;
+    };
+
+    VkBufferCreateInfo bufferInfo = {};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = size;
+    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkResult result = vk.CreateBuffer(device, &bufferInfo, nullptr, &buffer);
+    if (result != VK_SUCCESS) return fail("vkCreateBuffer(staging ring)", result);
+
+    VkMemoryRequirements requirements = {};
+    vk.GetBufferMemoryRequirements(device, buffer, &requirements);
+
+    uint32_t memoryTypeIndex = 0;
+    if (!FindMemoryType(context, requirements.memoryTypeBits,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                        &memoryTypeIndex, &flags))
+    {
+        if (outError) *outError = "No host-visible Vulkan memory type for staging ring";
+        return fail("FindMemoryType(staging ring)", VK_ERROR_OUT_OF_HOST_MEMORY);
+    }
+
+    VkMemoryAllocateInfo memoryInfo = {};
+    memoryInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    memoryInfo.allocationSize = requirements.size;
+    memoryInfo.memoryTypeIndex = memoryTypeIndex;
+    result = vk.AllocateMemory(device, &memoryInfo, nullptr, &memory);
+    if (result != VK_SUCCESS) return fail("vkAllocateMemory(staging ring)", result);
+
+    result = vk.BindBufferMemory(device, buffer, memory, 0);
+    if (result != VK_SUCCESS) return fail("vkBindBufferMemory(staging ring)", result);
+
+    out->buffer = buffer;
+    out->memory = memory;
+    out->capacity = size;
+    out->coherent = (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+    return true;
+}
+
+// Caller MUST hold gUploadsMutex.
+void ReturnStagingSlotLocked(const StagingSlot& slot)
+{
+    gStagingFreeList.push_back(slot);
+}
+
+void DestroyStagingSlotDirect(const VulkanContext& context, const StagingSlot& slot)
+{
+    if (!context.valid || context.instance.device == VK_NULL_HANDLE)
+    {
+        return;
+    }
+    const VulkanFunctions& vk = context.functions;
+    const VkDevice device = context.instance.device;
+    if (slot.buffer != VK_NULL_HANDLE) vk.DestroyBuffer(device, slot.buffer, nullptr);
+    if (slot.memory != VK_NULL_HANDLE) vk.FreeMemory(device, slot.memory, nullptr);
+}
+
+// Image-only half of PrepareUploadOnWorker (no staging, no memcpy). Worker thread.
+bool CreateAssemblyImageOnWorker(const VulkanContext& context, int width, int height, bool useSrgb,
+                                 VkImage* outImage, VkDeviceMemory* outMemory, std::string* outError)
+{
+    const VulkanFunctions& vk = context.functions;
+    const VkDevice device = context.instance.device;
+
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory imageMemory = VK_NULL_HANDLE;
+    auto fail = [&](const char* action, VkResult result) -> bool
+    {
+        if (outError)
+        {
+            *outError = std::string(action) + " failed with VkResult " + std::to_string(static_cast<int>(result));
+        }
+        if (image != VK_NULL_HANDLE) vk.DestroyImage(device, image, nullptr);
+        if (imageMemory != VK_NULL_HANDLE) vk.FreeMemory(device, imageMemory, nullptr);
+        return false;
+    };
+
+    VkImageCreateInfo imageInfo = {};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = useSrgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    imageInfo.extent.width = static_cast<uint32_t>(width);
+    imageInfo.extent.height = static_cast<uint32_t>(height);
+    imageInfo.extent.depth = 1;
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    // Same usage as PrepareUploadOnWorker — TRANSFER_SRC for the OpenXR composition
+    // layer blit-out, TRANSFER_DST for the tile copies, SAMPLED for the sphere blit.
+    imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                    | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                    | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VkResult result = vk.CreateImage(device, &imageInfo, nullptr, &image);
+    if (result != VK_SUCCESS) return fail("vkCreateImage(assembly)", result);
+
+    VkMemoryRequirements requirements = {};
+    vk.GetImageMemoryRequirements(device, image, &requirements);
+
+    uint32_t memoryTypeIndex = 0;
+    if (!FindMemoryType(context, requirements.memoryTypeBits,
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                        &memoryTypeIndex, nullptr))
+    {
+        if (outError) *outError = "No device-local Vulkan memory type for assembly image";
+        return fail("FindMemoryType(assembly image)", VK_ERROR_OUT_OF_DEVICE_MEMORY);
+    }
+
+    VkMemoryAllocateInfo memoryInfo = {};
+    memoryInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    memoryInfo.allocationSize = requirements.size;
+    memoryInfo.memoryTypeIndex = memoryTypeIndex;
+    result = vk.AllocateMemory(device, &memoryInfo, nullptr, &imageMemory);
+    if (result != VK_SUCCESS) return fail("vkAllocateMemory(assembly image)", result);
+
+    result = vk.BindImageMemory(device, image, imageMemory, 0);
+    if (result != VK_SUCCESS) return fail("vkBindImageMemory(assembly)", result);
+
+    *outImage = image;
+    *outMemory = imageMemory;
+    return true;
+}
+
+// Phase C for assemblies. Caller MUST hold gUploadsMutex. Reaps signaled fences,
+// destroys the transient command pool/buffer/fence, RETURNS stagings to the ring.
+void DrainCompletedAssembliesLocked()
+{
+    for (auto it = gInFlightAssemblies.begin(); it != gInFlightAssemblies.end(); )
+    {
+        const VulkanFunctions& vk = it->context.functions;
+        const VkDevice device = it->context.instance.device;
+        VkResult fenceState = vk.GetFenceStatus(device, it->fence);
+        if (fenceState == VK_NOT_READY)
+        {
+            ++it;
+            continue;
+        }
+        if (it->commandBuffer != VK_NULL_HANDLE && it->commandPool != VK_NULL_HANDLE)
+        {
+            vk.FreeCommandBuffers(device, it->commandPool, 1, &it->commandBuffer);
+        }
+        if (it->commandPool != VK_NULL_HANDLE) vk.DestroyCommandPool(device, it->commandPool, nullptr);
+        if (it->fence != VK_NULL_HANDLE)       vk.DestroyFence(device, it->fence, nullptr);
+        for (const StagingSlot& slot : it->stagings)
+        {
+            ReturnStagingSlotLocked(slot);
+        }
+        it = gInFlightAssemblies.erase(it);
+    }
+}
+
+// Phase B for assemblies (render thread, graphics-queue access). For each committed
+// assembly records ONE command buffer: UNDEFINED->TRANSFER_DST, N region copies
+// (disjoint tiles, no inter-copy barrier), TRANSFER_DST->SHADER_READ; one submit,
+// one fence. Fire-and-forget; stagings returned to the ring by Phase C.
+void SubmitPendingAssemblies()
+{
+    std::vector<PendingAssembly> drained;
+    {
+        std::lock_guard<std::mutex> lock(gUploadsMutex);
+        if (gPendingAssemblies.empty())
+        {
+            return;
+        }
+        drained.swap(gPendingAssemblies);
+    }
+
+    for (PendingAssembly& assembly : drained)
+    {
+        const VulkanContext& context = assembly.context;
+        auto returnStagings = [&]()
+        {
+            std::lock_guard<std::mutex> lock(gUploadsMutex);
+            for (const StagingSlot& slot : assembly.stagings) ReturnStagingSlotLocked(slot);
+        };
+
+        if (!context.valid)
+        {
+            LogMessage("Warn", "SubmitPendingAssemblies skipped: invalid Vulkan context");
+            returnStagings();
+            continue;
+        }
+        const VulkanFunctions& vk = context.functions;
+        const VkDevice device = context.instance.device;
+
+        VkCommandPool commandPool = VK_NULL_HANDLE;
+        VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        auto cleanupTransient = [&]()
+        {
+            if (commandBuffer != VK_NULL_HANDLE && commandPool != VK_NULL_HANDLE)
+                vk.FreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+            if (commandPool != VK_NULL_HANDLE) vk.DestroyCommandPool(device, commandPool, nullptr);
+            if (fence != VK_NULL_HANDLE)       vk.DestroyFence(device, fence, nullptr);
+        };
+        auto abort = [&](const char* where, VkResult result)
+        {
+            LogMessage("Error", "SubmitPendingAssemblies: %s=%d", where, static_cast<int>(result));
+            cleanupTransient();
+            returnStagings();
+        };
+
+        VkCommandPoolCreateInfo commandPoolInfo = {};
+        commandPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        commandPoolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+        commandPoolInfo.queueFamilyIndex = context.instance.queueFamilyIndex;
+        VkResult result = vk.CreateCommandPool(device, &commandPoolInfo, nullptr, &commandPool);
+        if (result != VK_SUCCESS) { abort("vkCreateCommandPool", result); continue; }
+
+        VkCommandBufferAllocateInfo commandBufferInfo = {};
+        commandBufferInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        commandBufferInfo.commandPool = commandPool;
+        commandBufferInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        commandBufferInfo.commandBufferCount = 1;
+        result = vk.AllocateCommandBuffers(device, &commandBufferInfo, &commandBuffer);
+        if (result != VK_SUCCESS) { abort("vkAllocateCommandBuffers", result); continue; }
+
+        VkCommandBufferBeginInfo beginInfo = {};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        result = vk.BeginCommandBuffer(commandBuffer, &beginInfo);
+        if (result != VK_SUCCESS) { abort("vkBeginCommandBuffer", result); continue; }
+
+        VkImageSubresourceRange range = {};
+        range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        range.baseMipLevel = 0;
+        range.levelCount = 1;
+        range.baseArrayLayer = 0;
+        range.layerCount = 1;
+
+        VkImageMemoryBarrier toDst = {};
+        toDst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDst.image = assembly.image;
+        toDst.subresourceRange = range;
+        toDst.srcAccessMask = 0;
+        toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vk.CmdPipelineBarrier(commandBuffer,
+                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              0, 0, nullptr, 0, nullptr, 1, &toDst);
+
+        for (size_t i = 0; i < assembly.regions.size(); ++i)
+        {
+            vk.CmdCopyBufferToImage(commandBuffer, assembly.stagings[i].buffer, assembly.image,
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &assembly.regions[i]);
+        }
+
+        VkImageMemoryBarrier toRead = {};
+        toRead.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        toRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        toRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toRead.image = assembly.image;
+        toRead.subresourceRange = range;
+        toRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vk.CmdPipelineBarrier(commandBuffer,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                              0, 0, nullptr, 0, nullptr, 1, &toRead);
+
+        result = vk.EndCommandBuffer(commandBuffer);
+        if (result != VK_SUCCESS) { abort("vkEndCommandBuffer", result); continue; }
+
+        VkFenceCreateInfo fenceInfo = {};
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        result = vk.CreateFence(device, &fenceInfo, nullptr, &fence);
+        if (result != VK_SUCCESS) { abort("vkCreateFence", result); continue; }
+
+        VkSubmitInfo submitInfo = {};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffer;
+        result = vk.QueueSubmit(context.instance.graphicsQueue, 1, &submitInfo, fence);
+        if (result != VK_SUCCESS) { abort("vkQueueSubmit", result); continue; }
+
+        InFlightAssembly inflight = {};
+        inflight.context = context;
+        inflight.image = assembly.image;
+        inflight.commandPool = commandPool;
+        inflight.commandBuffer = commandBuffer;
+        inflight.fence = fence;
+        inflight.stagings = std::move(assembly.stagings);
+        {
+            std::lock_guard<std::mutex> lock(gUploadsMutex);
+            gInFlightAssemblies.push_back(std::move(inflight));
+        }
+        commandPool = VK_NULL_HANDLE;
+        commandBuffer = VK_NULL_HANDLE;
+        fence = VK_NULL_HANDLE;
+    }
+}
+
+// Shutdown / device-loss flush for assembly staging/command resources. The assembly
+// device images live in gTextureResources and are freed by DrainOutstandingTextures;
+// here we free the host stagings + any transient command pools/fences.
+void DestroyAssemblyResourcesBlocking()
+{
+    std::vector<PendingAssembly> pending;
+    std::vector<InFlightAssembly> inflight;
+    std::vector<StagingSlot> ring;
+    {
+        std::lock_guard<std::mutex> lock(gUploadsMutex);
+        pending.swap(gPendingAssemblies);
+        inflight.swap(gInFlightAssemblies);
+        ring.swap(gStagingFreeList);
+    }
+    std::vector<AssemblyImage> inProgress;
+    {
+        std::lock_guard<std::mutex> lock(gAssembliesMutex);
+        inProgress.reserve(gAssemblies.size());
+        for (auto& entry : gAssemblies) inProgress.push_back(std::move(entry.second));
+        gAssemblies.clear();
+    }
+
+    for (InFlightAssembly& assembly : inflight)
+    {
+        if (!assembly.context.valid) continue;
+        const VulkanFunctions& vk = assembly.context.functions;
+        const VkDevice device = assembly.context.instance.device;
+        if (assembly.fence != VK_NULL_HANDLE)
+        {
+            vk.WaitForFences(device, 1, &assembly.fence, VK_TRUE, std::numeric_limits<uint64_t>::max());
+        }
+        if (assembly.commandBuffer != VK_NULL_HANDLE && assembly.commandPool != VK_NULL_HANDLE)
+            vk.FreeCommandBuffers(device, assembly.commandPool, 1, &assembly.commandBuffer);
+        if (assembly.commandPool != VK_NULL_HANDLE) vk.DestroyCommandPool(device, assembly.commandPool, nullptr);
+        if (assembly.fence != VK_NULL_HANDLE)       vk.DestroyFence(device, assembly.fence, nullptr);
+        for (const StagingSlot& slot : assembly.stagings) DestroyStagingSlotDirect(assembly.context, slot);
+    }
+    for (PendingAssembly& assembly : pending)
+        for (const StagingSlot& slot : assembly.stagings) DestroyStagingSlotDirect(assembly.context, slot);
+    for (AssemblyImage& assembly : inProgress)
+        for (const StagingSlot& slot : assembly.stagings) DestroyStagingSlotDirect(assembly.context, slot);
+
+    if (!ring.empty())
+    {
+        VulkanContext context = {};
+        {
+            std::lock_guard<std::mutex> lock(gUnityStateMutex);
+            context = gVulkanContext;
+        }
+        for (const StagingSlot& slot : ring) DestroyStagingSlotDirect(context, slot);
+    }
+}
+
 // Phase B: render-thread callback fired via vulkanV2->AccessQueue(...). Drains
 // gPendingUploads, for each records vkCmdPipelineBarrier × 2 + vkCmdCopyBufferToImage
 // onto a transient command buffer and submits. The submit is FIRE-AND-FORGET:
@@ -1126,10 +1561,7 @@ void UNITY_INTERFACE_API SubmitPendingUploadsCallback(int /*eventId*/, void* /*u
     {
         std::lock_guard<std::mutex> lock(gUploadsMutex);
         DrainCompletedInFlightsLocked();
-        if (gPendingUploads.empty())
-        {
-            return;
-        }
+        DrainCompletedAssembliesLocked();
         drained.swap(gPendingUploads);
     }
 
@@ -1292,6 +1724,9 @@ void UNITY_INTERFACE_API SubmitPendingUploadsCallback(int /*eventId*/, void* /*u
         commandBuffer = VK_NULL_HANDLE;
         fence = VK_NULL_HANDLE;
     }
+
+    // Batched pano tile assemblies share this one render event / queue-access tick.
+    SubmitPendingAssemblies();
 }
 
 
@@ -1587,6 +2022,289 @@ NATIVE_TEXTURE_API void* UNITY_INTERFACE_API CreateFromFileWithOptions(
     return texture;
 }
 
+// ---- Pano GPU tile assembly exports -------------------------------------
+// Begin -> N x UploadTileRegion -> Finish, then C# wraps the handle with
+// Texture2D.CreateExternalTexture and fires GL.IssuePluginEvent(GetRenderEventFunc(),
+// kEventIdSubmitUploads) ONCE. On a pre-Finish fault/cancel, C# calls AbortImage.
+// Threading: BeginPanoAssembly/UploadTileRegion/FinishPanoAssembly run on Task.Run
+// workers (device-level ops + host memcpy only, NO vkCmd*/vkQueueSubmit — the
+// I2 SIGSEGV invariant). The batched copy + barriers + submit happen on the render
+// thread in SubmitPendingAssemblies.
+
+NATIVE_TEXTURE_API void* UNITY_INTERFACE_API BeginPanoAssembly(int width, int height, bool useSrgb)
+{
+    if (width <= 0 || height <= 0)
+    {
+        LogMessage("Error", "BeginPanoAssembly failed: invalid size %dx%d", width, height);
+        return nullptr;
+    }
+    if (width > std::numeric_limits<int>::max() / kBytesPerPixel)
+    {
+        LogMessage("Error", "BeginPanoAssembly failed: width %d overflows bytesPerRow", width);
+        return nullptr;
+    }
+
+    VulkanContext context = {};
+    if (!SnapshotVulkanContext(&context))
+    {
+        return nullptr;
+    }
+
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory imageMemory = VK_NULL_HANDLE;
+    std::string error;
+    if (!CreateAssemblyImageOnWorker(context, width, height, useSrgb, &image, &imageMemory, &error))
+    {
+        LogMessage("Error", "BeginPanoAssembly failed: %s", error.empty() ? "unknown" : error.c_str());
+        return nullptr;
+    }
+
+    VkImage* externalImage = new (std::nothrow) VkImage(image);
+    if (!externalImage)
+    {
+        const VulkanFunctions& vk = context.functions;
+        const VkDevice device = context.instance.device;
+        vk.DestroyImage(device, image, nullptr);
+        vk.FreeMemory(device, imageMemory, nullptr);
+        LogMessage("Error", "BeginPanoAssembly failed: unable to allocate external VkImage handle");
+        return nullptr;
+    }
+
+    const TextureKey key = TextureKeyFromExternalImage(externalImage);
+
+    // Register for Release() (same handle-as-key discipline as CreateWithOptions).
+    VulkanTextureResource resource = {};
+    resource.externalImage = externalImage;
+    resource.image = image;
+    resource.memory = imageMemory;
+    resource.context = context;
+    resource.width = static_cast<uint32_t>(width);
+    resource.height = static_cast<uint32_t>(height);
+    {
+        std::lock_guard<std::mutex> lock(gTextureMutex);
+        gTextureResources[key] = resource;
+    }
+
+    AssemblyImage assembly = {};
+    assembly.context = context;
+    assembly.image = image;
+    assembly.imageMemory = imageMemory;
+    assembly.externalImage = externalImage;
+    assembly.width = static_cast<uint32_t>(width);
+    assembly.height = static_cast<uint32_t>(height);
+    {
+        std::lock_guard<std::mutex> lock(gAssembliesMutex);
+        gAssemblies[key] = std::move(assembly);
+    }
+
+    return externalImage;
+}
+
+NATIVE_TEXTURE_API bool UNITY_INTERFACE_API UploadTileRegion(
+    void* assemblyImage,
+    unsigned char* tileRgba,
+    int tileStride,
+    int validW,
+    int validH,
+    int dstX,
+    int dstY)
+{
+    if (!assemblyImage || !tileRgba)
+    {
+        LogMessage("Error", "UploadTileRegion failed: null image or tile");
+        return false;
+    }
+    if (validW <= 0 || validH <= 0 || tileStride <= 0)
+    {
+        LogMessage("Error", "UploadTileRegion failed: invalid dims %dx%d stride %d", validW, validH, tileStride);
+        return false;
+    }
+    if (dstX < 0 || dstY < 0)
+    {
+        LogMessage("Error", "UploadTileRegion failed: negative dst %d,%d", dstX, dstY);
+        return false;
+    }
+    if (validW > tileStride / kBytesPerPixel)
+    {
+        LogMessage("Error", "UploadTileRegion failed: validW %d exceeds stride %d", validW, tileStride);
+        return false;
+    }
+
+    const TextureKey key = static_cast<TextureKey>(reinterpret_cast<uintptr_t>(assemblyImage));
+
+    VulkanContext context = {};
+    {
+        std::lock_guard<std::mutex> lock(gAssembliesMutex);
+        auto it = gAssemblies.find(key);
+        if (it == gAssemblies.end())
+        {
+            LogMessage("Warn", "UploadTileRegion ignored: unknown assembly %p", assemblyImage);
+            return false;
+        }
+        context = it->second.context;
+    }
+    if (!context.valid)
+    {
+        return false;
+    }
+
+    const VkDeviceSize need = static_cast<VkDeviceSize>(validW) *
+                              static_cast<VkDeviceSize>(validH) *
+                              static_cast<VkDeviceSize>(kBytesPerPixel);
+    StagingSlot slot = {};
+    std::string error;
+    if (!AcquireStagingSlot(context, need, &slot, &error))
+    {
+        LogMessage("Error", "UploadTileRegion failed to acquire staging: %s", error.empty() ? "unknown" : error.c_str());
+        return false;
+    }
+
+    const VulkanFunctions& vk = context.functions;
+    const VkDevice device = context.instance.device;
+    void* mapped = nullptr;
+    // Map the WHOLE slot (not just `need`) so the VK_WHOLE_SIZE flush below stays within the
+    // mapped range — a reused ring slot has capacity >= need, so mapping `need` would leave
+    // VK_WHOLE_SIZE flushing past the mapped range (VUID-VkMappedMemoryRange-size-01389).
+    VkResult result = vk.MapMemory(device, slot.memory, 0, slot.capacity, 0, &mapped);
+    if (result != VK_SUCCESS)
+    {
+        LogMessage("Error", "UploadTileRegion vkMapMemory=%d", static_cast<int>(result));
+        std::lock_guard<std::mutex> lock(gUploadsMutex);
+        ReturnStagingSlotLocked(slot);
+        return false;
+    }
+
+    // Row-reversed crop reproduces the CPU bottom-up flip: staging row t receives
+    // source row (validH-1-t). Combined with the C#-computed dstY = imageH -
+    // panoPixelY - validH this is pixel-identical to BlitTileIntoBuffer.
+    const size_t rowBytes = static_cast<size_t>(validW) * kBytesPerPixel;
+    uint8_t* destination = static_cast<uint8_t*>(mapped);
+    for (int t = 0; t < validH; ++t)
+    {
+        const uint8_t* source = tileRgba + static_cast<size_t>(validH - 1 - t) * static_cast<size_t>(tileStride);
+        std::memcpy(destination + static_cast<size_t>(t) * rowBytes, source, rowBytes);
+    }
+
+    if (!slot.coherent)
+    {
+        VkMappedMemoryRange memoryRange = {};
+        memoryRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        memoryRange.memory = slot.memory;
+        memoryRange.offset = 0;
+        memoryRange.size = VK_WHOLE_SIZE;
+        VkResult flushResult = vk.FlushMappedMemoryRanges(device, 1, &memoryRange);
+        if (flushResult != VK_SUCCESS)
+        {
+            LogMessage("Error", "UploadTileRegion vkFlushMappedMemoryRanges=%d", static_cast<int>(flushResult));
+            vk.UnmapMemory(device, slot.memory);
+            std::lock_guard<std::mutex> lock(gUploadsMutex);
+            ReturnStagingSlotLocked(slot);
+            return false;
+        }
+    }
+    vk.UnmapMemory(device, slot.memory);
+
+    VkBufferImageCopy region = {};
+    region.bufferOffset = 0;
+    region.bufferRowLength = static_cast<uint32_t>(validW);
+    region.bufferImageHeight = static_cast<uint32_t>(validH);
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset.x = dstX;
+    region.imageOffset.y = dstY;
+    region.imageOffset.z = 0;
+    region.imageExtent.width = static_cast<uint32_t>(validW);
+    region.imageExtent.height = static_cast<uint32_t>(validH);
+    region.imageExtent.depth = 1;
+
+    bool appended = false;
+    {
+        std::lock_guard<std::mutex> lock(gAssembliesMutex);
+        auto it = gAssemblies.find(key);
+        if (it != gAssemblies.end())
+        {
+            it->second.regions.push_back(region);
+            it->second.stagings.push_back(slot);
+            appended = true;
+        }
+    }
+    if (!appended)
+    {
+        // Aborted/released between the snapshot and here — return the slot.
+        std::lock_guard<std::mutex> lock(gUploadsMutex);
+        ReturnStagingSlotLocked(slot);
+        return false;
+    }
+    return true;
+}
+
+NATIVE_TEXTURE_API void UNITY_INTERFACE_API FinishPanoAssembly(void* assemblyImage)
+{
+    if (!assemblyImage)
+    {
+        return;
+    }
+    const TextureKey key = static_cast<TextureKey>(reinterpret_cast<uintptr_t>(assemblyImage));
+
+    PendingAssembly pending = {};
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(gAssembliesMutex);
+        auto it = gAssemblies.find(key);
+        if (it != gAssemblies.end())
+        {
+            pending.context = it->second.context;
+            pending.image = it->second.image;
+            pending.regions = std::move(it->second.regions);
+            pending.stagings = std::move(it->second.stagings);
+            gAssemblies.erase(it);
+            found = true;
+        }
+    }
+    if (!found)
+    {
+        LogMessage("Warn", "FinishPanoAssembly ignored: unknown assembly %p", assemblyImage);
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(gUploadsMutex);
+    gPendingAssemblies.push_back(std::move(pending));
+}
+
+NATIVE_TEXTURE_API void UNITY_INTERFACE_API AbortImage(void* assemblyImage)
+{
+    if (!assemblyImage)
+    {
+        return;
+    }
+    const TextureKey key = static_cast<TextureKey>(reinterpret_cast<uintptr_t>(assemblyImage));
+
+    // Drop the in-progress assembly (if still open) and return its stagings.
+    AssemblyImage assembly = {};
+    bool hadAssembly = false;
+    {
+        std::lock_guard<std::mutex> lock(gAssembliesMutex);
+        auto it = gAssemblies.find(key);
+        if (it != gAssemblies.end())
+        {
+            assembly = std::move(it->second);
+            gAssemblies.erase(it);
+            hadAssembly = true;
+        }
+    }
+    if (hadAssembly && !assembly.stagings.empty())
+    {
+        std::lock_guard<std::mutex> lock(gUploadsMutex);
+        for (const StagingSlot& slot : assembly.stagings) ReturnStagingSlotLocked(slot);
+    }
+
+    // Destroy the device image via the normal fence-gated Release path (also scans
+    // gPendingAssemblies/gInFlightAssemblies for a committed-then-aborted race).
+    Release(assemblyImage);
+}
+
 NATIVE_TEXTURE_API void UNITY_INTERFACE_API Release(void* texPtr)
 {
     if (!texPtr)
@@ -1594,10 +2312,11 @@ NATIVE_TEXTURE_API void UNITY_INTERFACE_API Release(void* texPtr)
         return;
     }
 
+    const TextureKey key = static_cast<TextureKey>(reinterpret_cast<uintptr_t>(texPtr));
+
     VulkanTextureResource resource = {};
     {
         std::lock_guard<std::mutex> lock(gTextureMutex);
-        const TextureKey key = static_cast<TextureKey>(reinterpret_cast<uintptr_t>(texPtr));
         const auto iterator = gTextureResources.find(key);
         if (iterator == gTextureResources.end())
         {
@@ -1609,15 +2328,34 @@ NATIVE_TEXTURE_API void UNITY_INTERFACE_API Release(void* texPtr)
         gTextureResources.erase(iterator);
     }
 
+    // Defensive: if this handle was still mid-assembly (disposed without Abort/Finish),
+    // drop the in-progress record and return its stagings below under gUploadsMutex.
+    std::vector<StagingSlot> orphanStagings;
+    {
+        std::lock_guard<std::mutex> lock(gAssembliesMutex);
+        auto it = gAssemblies.find(key);
+        if (it != gAssemblies.end())
+        {
+            orphanStagings = std::move(it->second.stagings);
+            gAssemblies.erase(it);
+        }
+    }
+
     // If an upload for this image is still pending (Phase A done but Phase B
     // not yet run) OR in-flight (Phase B submitted but fence not signaled),
     // destroying the VkImage now would crash on Adreno (GPU still using it).
     //
     // - Pending: just remove from queue (no GPU work started) + free its
     //   staging immediately, then proceed to destroy the image.
-    // - In-flight: wait for the fence synchronously (rare path; usually the
-    //   C# ReleaseScheduler defers Release by 1+ frames, by which point the
-    //   upload is long done and the fence has been reaped by Phase C).
+    // - In-flight: MOVE the entries out under the lock, then wait the fence
+    //   OUTSIDE the lock. Holding gUploadsMutex across a blocking vkWaitForFences
+    //   would stall the render thread (which takes the same mutex at the top of
+    //   every SubmitPendingUploadsCallback tick) for the whole GPU copy — a frame
+    //   hitch on pano supersede. The fences signal from GPU completion independent
+    //   of the render thread, so waiting outside the lock is safe (mirrors the
+    //   swap-then-work discipline in ProcessPendingDestroys).
+    std::vector<InFlightUpload> inflightUploads;
+    std::vector<InFlightAssembly> inflightAssemblies;
     {
         std::lock_guard<std::mutex> lock(gUploadsMutex);
         for (auto it = gPendingUploads.begin(); it != gPendingUploads.end(); )
@@ -1635,7 +2373,85 @@ NATIVE_TEXTURE_API void UNITY_INTERFACE_API Release(void* texPtr)
                 ++it;
             }
         }
-        WaitAndFreeInFlightForImageLocked(resource.image);
+        for (auto it = gInFlightUploads.begin(); it != gInFlightUploads.end(); )
+        {
+            if (it->image == resource.image)
+            {
+                inflightUploads.push_back(std::move(*it));
+                it = gInFlightUploads.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+
+        for (const StagingSlot& slot : orphanStagings) ReturnStagingSlotLocked(slot);
+
+        // Committed-but-not-submitted assemblies for this image: drop + return stagings.
+        for (auto it = gPendingAssemblies.begin(); it != gPendingAssemblies.end(); )
+        {
+            if (it->image == resource.image)
+            {
+                for (const StagingSlot& slot : it->stagings) ReturnStagingSlotLocked(slot);
+                it = gPendingAssemblies.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+        for (auto it = gInFlightAssemblies.begin(); it != gInFlightAssemblies.end(); )
+        {
+            if (it->image == resource.image)
+            {
+                inflightAssemblies.push_back(std::move(*it));
+                it = gInFlightAssemblies.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+
+    // Outside gUploadsMutex: wait the GPU fences (Adreno would crash if the image were
+    // destroyed / the staging reused mid-copy) and destroy the transient command resources.
+    for (InFlightUpload& upload : inflightUploads)
+    {
+        const VulkanFunctions& vk = upload.context.functions;
+        const VkDevice device = upload.context.instance.device;
+        if (upload.fence != VK_NULL_HANDLE)
+        {
+            vk.WaitForFences(device, 1, &upload.fence, VK_TRUE, std::numeric_limits<uint64_t>::max());
+        }
+        if (upload.commandBuffer != VK_NULL_HANDLE && upload.commandPool != VK_NULL_HANDLE)
+            vk.FreeCommandBuffers(device, upload.commandPool, 1, &upload.commandBuffer);
+        if (upload.commandPool != VK_NULL_HANDLE) vk.DestroyCommandPool(device, upload.commandPool, nullptr);
+        if (upload.fence != VK_NULL_HANDLE)       vk.DestroyFence(device, upload.fence, nullptr);
+        if (upload.stagingBuffer != VK_NULL_HANDLE) vk.DestroyBuffer(device, upload.stagingBuffer, nullptr);
+        if (upload.stagingMemory != VK_NULL_HANDLE) vk.FreeMemory(device, upload.stagingMemory, nullptr);
+    }
+    for (InFlightAssembly& assembly : inflightAssemblies)
+    {
+        const VulkanFunctions& vk = assembly.context.functions;
+        const VkDevice device = assembly.context.instance.device;
+        if (assembly.fence != VK_NULL_HANDLE)
+        {
+            vk.WaitForFences(device, 1, &assembly.fence, VK_TRUE, std::numeric_limits<uint64_t>::max());
+        }
+        if (assembly.commandBuffer != VK_NULL_HANDLE && assembly.commandPool != VK_NULL_HANDLE)
+            vk.FreeCommandBuffers(device, assembly.commandPool, 1, &assembly.commandBuffer);
+        if (assembly.commandPool != VK_NULL_HANDLE) vk.DestroyCommandPool(device, assembly.commandPool, nullptr);
+        if (assembly.fence != VK_NULL_HANDLE)       vk.DestroyFence(device, assembly.fence, nullptr);
+    }
+    if (!inflightAssemblies.empty())
+    {
+        std::lock_guard<std::mutex> lock(gUploadsMutex);
+        for (InFlightAssembly& assembly : inflightAssemblies)
+        {
+            for (const StagingSlot& slot : assembly.stagings) ReturnStagingSlotLocked(slot);
+        }
     }
 
     VulkanContext context = {};
@@ -1710,6 +2526,7 @@ NATIVE_TEXTURE_API void UNITY_INTERFACE_API UnityPluginUnload()
     }
 
     FlushPendingDestroysBlocking();
+    DestroyAssemblyResourcesBlocking();
     DrainOutstandingTextures("Plugin unload", context.valid ? &context : nullptr);
 
     if (unityGraphics)

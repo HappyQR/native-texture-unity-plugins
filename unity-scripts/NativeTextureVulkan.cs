@@ -18,6 +18,7 @@ namespace NativeTexture
         private static GraphicsDeviceType s_cachedGraphicsDeviceType;
         private static bool s_hasCachedGraphicsDeviceType;
         private static bool s_pluginLoaded;
+        private static bool s_renderPumpRegistered;
 
         // Earlier versions of this file held a SemaphoreSlim(1) here to serialize the
         // native Create*WithOptions calls. That was a workaround for a Quest SIGSEGV
@@ -435,6 +436,188 @@ namespace NativeTexture
             NativeTextureReleaseScheduler.ReleaseExternalTexture("Vulkan", texture, nativeTexture, Release);
         }
 
+        // Kicks the render-thread callback so the native pending-destroy / in-flight reap
+        // queues advance even when no new texture is being created. Fired by the
+        // ReleaseScheduler for a few frames after each release. Main thread only (Unity
+        // requires GL.IssuePluginEvent on the main thread); cheap when the queues are empty.
+        internal static void PumpRenderThread()
+        {
+            if (!s_pluginLoaded)
+            {
+                return;
+            }
+
+            GL.IssuePluginEvent(GetRenderEventFunc(), SubmitUploadsEventId);
+        }
+
+        // ---- Pano GPU tile assembly (region-copy) ---------------------------
+        // Begin -> N x UploadPanoTileAsync (worker threads) -> FinishPanoAssemblyAsync.
+        // Replaces the CPU 134MB stitch buffer: each tile is copied straight into a
+        // persistent device image, halving peak memory. Threading matches the proven
+        // Create path — device-level ops + host memcpy on Task.Run workers; the batched
+        // vkCmd copy/barriers/submit run on the render thread via the existing event.
+
+        public static async Task<IntPtr> BeginPanoAssemblyAsync(
+            int width,
+            int height,
+            bool linear,
+            CancellationToken cancellationToken)
+        {
+            TryCaptureMainThreadContext();
+            if (width <= 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(width));
+            }
+            if (height <= 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(height));
+            }
+
+            await EnsurePluginLoadedAsync(cancellationToken).ConfigureAwait(false);
+            bool useSrgb = await RunOnMainThreadAsync(() =>
+            {
+                EnsureVulkanBackendOnMainThread();
+                return ShouldUseSrgbNativeFormat(linear);
+            }, cancellationToken).ConfigureAwait(false);
+
+            return await Task.Run(() =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                IntPtr image = BeginPanoAssembly(width, height, useSrgb);
+                if (image == IntPtr.Zero)
+                {
+                    throw new InvalidOperationException("Native BeginPanoAssembly returned a null image.");
+                }
+
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    AbortImage(image);
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+
+                return image;
+            }, cancellationToken).ConfigureAwait(false);
+        }
+
+        public static Task UploadPanoTileAsync(
+            IntPtr assemblyImage,
+            byte[] tileRgba,
+            int tileStride,
+            int validW,
+            int validH,
+            int dstX,
+            int dstY,
+            CancellationToken cancellationToken)
+        {
+            if (assemblyImage == IntPtr.Zero)
+            {
+                throw new ArgumentException("Assembly image handle is null.", nameof(assemblyImage));
+            }
+            if (tileRgba == null)
+            {
+                throw new ArgumentNullException(nameof(tileRgba));
+            }
+
+            return Task.Run(() =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                GCHandle tileHandle = default;
+                try
+                {
+                    tileHandle = GCHandle.Alloc(tileRgba, GCHandleType.Pinned);
+                    bool uploaded = UploadTileRegion(
+                        assemblyImage,
+                        tileHandle.AddrOfPinnedObject(),
+                        tileStride,
+                        validW,
+                        validH,
+                        dstX,
+                        dstY);
+                    if (!uploaded)
+                    {
+                        throw new InvalidOperationException("Native UploadTileRegion failed.");
+                    }
+                }
+                finally
+                {
+                    if (tileHandle.IsAllocated)
+                    {
+                        tileHandle.Free();
+                    }
+                }
+            }, cancellationToken);
+        }
+
+        public static Task<NativeTextureVulkanTexture> FinishPanoAssemblyAsync(
+            IntPtr assemblyImage,
+            int width,
+            int height,
+            bool linear,
+            CancellationToken cancellationToken)
+        {
+            if (assemblyImage == IntPtr.Zero)
+            {
+                throw new ArgumentException("Assembly image handle is null.", nameof(assemblyImage));
+            }
+
+            return WrapAssembledTextureAsync(assemblyImage, width, height, linear, cancellationToken);
+        }
+
+        public static void AbortPanoAssembly(IntPtr assemblyImage)
+        {
+            if (assemblyImage != IntPtr.Zero)
+            {
+                AbortImage(assemblyImage);
+            }
+        }
+
+        private static async Task<NativeTextureVulkanTexture> WrapAssembledTextureAsync(
+            IntPtr assemblyImage,
+            int width,
+            int height,
+            bool linear,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                Texture2D texture = await RunOnMainThreadAsync(() =>
+                {
+                    EnsureVulkanBackendOnMainThread();
+
+                    // Commit the assembly (queue op, no GPU work), wrap the device image as
+                    // a Texture2D, then fire the ONE render event that drains + submits the
+                    // batched tile copies. The event is inserted into Unity's render stream
+                    // ahead of any draw the caller issues with this Texture2D, so the image
+                    // is populated + SHADER_READ before it is sampled (no black frame).
+                    FinishPanoAssembly(assemblyImage);
+                    Texture2D wrapped = Texture2D.CreateExternalTexture(width, height, TextureFormat.RGBA32, false, linear, assemblyImage);
+                    GL.IssuePluginEvent(GetRenderEventFunc(), SubmitUploadsEventId);
+
+                    return wrapped;
+                }, cancellationToken).ConfigureAwait(false);
+
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    ReleaseExternalTexture(texture, assemblyImage);
+                    assemblyImage = IntPtr.Zero;
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+
+                return new NativeTextureVulkanTexture(texture, assemblyImage);
+            }
+            catch
+            {
+                if (assemblyImage != IntPtr.Zero)
+                {
+                    AbortImage(assemblyImage);
+                }
+
+                throw;
+            }
+        }
+
         private static async Task<NativeTextureVulkanTexture> WrapNativeTextureAsync(
             IntPtr nativeTexture,
             int width,
@@ -531,6 +714,14 @@ namespace NativeTexture
             {
                 throw new NotSupportedException(
                     $"NativeTextureVulkan only supports Vulkan. Current backend is {s_cachedGraphicsDeviceType}.");
+            }
+
+            // Backend confirmed Vulkan (main thread) — register the render-thread pump once so
+            // the ReleaseScheduler can drain fence-gated destroys after the last pano load.
+            if (!s_renderPumpRegistered)
+            {
+                s_renderPumpRegistered = true;
+                NativeTextureReleaseScheduler.RegisterRenderPump(PumpRenderThread);
             }
         }
 
@@ -762,6 +953,26 @@ namespace NativeTexture
         [DllImport(PluginName, EntryPoint = "SaveToFile")]
         [return: MarshalAs(UnmanagedType.I1)]
         private static extern bool SaveToFile(string fileName, IntPtr rgba, int width, int height);
+
+        [DllImport(PluginName, EntryPoint = "BeginPanoAssembly")]
+        private static extern IntPtr BeginPanoAssembly(int width, int height, [MarshalAs(UnmanagedType.I1)] bool useSrgb);
+
+        [DllImport(PluginName, EntryPoint = "UploadTileRegion")]
+        [return: MarshalAs(UnmanagedType.I1)]
+        private static extern bool UploadTileRegion(
+            IntPtr assemblyImage,
+            IntPtr tileRgba,
+            int tileStride,
+            int validW,
+            int validH,
+            int dstX,
+            int dstY);
+
+        [DllImport(PluginName, EntryPoint = "FinishPanoAssembly")]
+        private static extern void FinishPanoAssembly(IntPtr assemblyImage);
+
+        [DllImport(PluginName, EntryPoint = "AbortImage")]
+        private static extern void AbortImage(IntPtr assemblyImage);
 
         // Event ID matched in OnRenderEvent in NativeTexture.cpp. ConfigureEvent
         // is registered on this ID during device init so the render-thread callback

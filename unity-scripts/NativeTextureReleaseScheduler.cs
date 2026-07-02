@@ -10,6 +10,14 @@ namespace NativeTexture
     {
         private const int DeferredReleaseFrameDelay = 1;
 
+        // After a native release is scheduled, keep pumping the backend's render-thread
+        // queues for this many frames so a fence-gated destroy (which needs one event to arm
+        // and another to reap) actually completes even when no new texture is being created.
+        // Without it, the last released device image lingers until the next Create/Finish —
+        // the "memory not released after the final pano load" symptom. 6 frames comfortably
+        // covers the 1-frame release defer + arm + reap; idle frames don't pump.
+        private const int RenderPumpFrameWindow = 6;
+
         private static readonly object s_sync = new object();
         private static readonly List<ScheduledRelease> s_pendingReleases = new List<ScheduledRelease>();
 
@@ -17,6 +25,10 @@ namespace NativeTexture
         private static int s_mainThreadId;
         private static ReleasePump s_releasePump;
         private static bool s_applicationQuitting;
+        // Backend-specific render-thread pump (Vulkan only; Metal/D3D12 destroy synchronously
+        // and never register one). Touched only on the Unity main thread.
+        private static Action s_renderPump;
+        private static int s_renderPumpFramesRemaining;
 
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
         private static void CaptureRuntimeState()
@@ -57,6 +69,25 @@ namespace NativeTexture
             if (Thread.CurrentThread.ManagedThreadId == mainThreadId)
             {
                 EnsureReleasePumpOnMainThread();
+            }
+        }
+
+        // Registered by the Vulkan backend (main thread) so the ReleasePump can advance the
+        // native render-thread destroy / in-flight reap queues after a release. No-op for
+        // backends that destroy synchronously.
+        internal static void RegisterRenderPump(Action pump)
+        {
+            if (pump == null)
+            {
+                throw new ArgumentNullException(nameof(pump));
+            }
+
+            lock (s_sync)
+            {
+                if (s_renderPump == null)
+                {
+                    s_renderPump = pump;
+                }
             }
         }
 
@@ -109,6 +140,10 @@ namespace NativeTexture
                         Time.frameCount + DeferredReleaseFrameDelay,
                         nativeRelease));
                 }
+
+                // Keep the render-thread pump running for a few frames so the fence-gated
+                // native destroy this release enqueues actually drains (main-thread only).
+                s_renderPumpFramesRemaining = RenderPumpFrameWindow;
             });
         }
 
@@ -253,6 +288,10 @@ namespace NativeTexture
             {
                 SafeRelease(pending.BackendName, pending.NativeTexture, pending.Release);
             }
+
+            // The native Release just enqueued fence-gated destroy(s); refresh the pump window
+            // anchored to this actual enqueue so the destroy drains within the next few frames.
+            s_renderPumpFramesRemaining = RenderPumpFrameWindow;
         }
 
         private static void SafeRelease(string backendName, IntPtr nativeTexture, Action<IntPtr> nativeRelease)
@@ -296,6 +335,19 @@ namespace NativeTexture
             private void LateUpdate()
             {
                 FlushReadyReleases(flushAll: false);
+
+                // Advance the backend render-thread destroy / reap queues for a bounded window
+                // after each release, so a freed device image is actually reaped instead of
+                // lingering until the next texture create/finish event.
+                if (s_renderPumpFramesRemaining > 0)
+                {
+                    Action pump = s_renderPump;
+                    if (pump != null)
+                    {
+                        pump();
+                    }
+                    s_renderPumpFramesRemaining--;
+                }
             }
 
             private void OnApplicationQuit()

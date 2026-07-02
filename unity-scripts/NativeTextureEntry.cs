@@ -273,6 +273,58 @@ namespace NativeTexture
             }
         }
 
+        // ---- Pano GPU tile assembly (Vulkan-only, region-copy) --------------
+        // The loader branches on DeviceImageAssemblySupported: Vulkan uses the
+        // Begin/UploadTile/Finish device-image path (no 134MB CPU stitch buffer);
+        // Metal/D3D12 (editor/Mac) fall back to the whole-image CreateAsync path.
+
+        public static bool DeviceImageAssemblySupported => Backend == NativeTextureBackend.Vulkan;
+
+        public static Task<IntPtr> BeginPanoAssemblyAsync(
+            int width,
+            int height,
+            bool linear,
+            CancellationToken cancellationToken)
+        {
+            if (GetValidatedBackend() != NativeTextureBackend.Vulkan)
+            {
+                throw CreateUnsupportedBackendException();
+            }
+
+            return NativeTextureVulkan.BeginPanoAssemblyAsync(width, height, linear, cancellationToken);
+        }
+
+        public static Task UploadPanoTileAsync(
+            IntPtr assemblyImage,
+            byte[] tileRgba,
+            int tileStride,
+            int validW,
+            int validH,
+            int dstX,
+            int dstY,
+            CancellationToken cancellationToken)
+        {
+            return NativeTextureVulkan.UploadPanoTileAsync(
+                assemblyImage, tileRgba, tileStride, validW, validH, dstX, dstY, cancellationToken);
+        }
+
+        public static async Task<INativeTextureHandle> FinishPanoAssemblyAsync(
+            IntPtr assemblyImage,
+            int width,
+            int height,
+            bool linear,
+            CancellationToken cancellationToken)
+        {
+            return await NativeTextureVulkan
+                .FinishPanoAssemblyAsync(assemblyImage, width, height, linear, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        public static void AbortPanoAssembly(IntPtr assemblyImage)
+        {
+            NativeTextureVulkan.AbortPanoAssembly(assemblyImage);
+        }
+
         private static NativeTextureBackend GetValidatedBackend()
         {
             NativeTextureBackend backend = Backend;
