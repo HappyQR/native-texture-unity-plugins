@@ -1113,6 +1113,25 @@ void ProcessPendingDestroys()
 
 // Shutdown / device-loss flush: blocking destruction of every still-pending entry. A host
 // stall is acceptable here (the session is tearing down). Must run with a live context.
+// Bounded fence wait for teardown / release paths. An infinite (UINT64_MAX) wait hangs the
+// calling thread forever if the fence never signals — which is exactly what happens when the
+// Android Surface is destroyed (app backgrounded / reset / quit) and the queued GPU work is
+// abandoned. That hang on the render/main thread during onSurfaceDestroyed trips Android's ANR
+// watchdog (oculus:android_anr ... onSurfaceDestroyedNative). Cap the wait; on timeout / device
+// loss we proceed to destroy anyway — during teardown the device is going away regardless, and a
+// benign early free is far better than an ANR.
+static constexpr uint64_t kFenceWaitTimeoutNs = 500000000ull; // 0.5s — >>10x any real GPU copy
+
+void WaitFenceBounded(const VulkanFunctions& vk, VkDevice device, VkFence fence, const char* where)
+{
+    const VkResult result = vk.WaitForFences(device, 1, &fence, VK_TRUE, kFenceWaitTimeoutNs);
+    if (result != VK_SUCCESS)
+    {
+        LogMessage("Warn", "%s: bounded fence wait returned VkResult %d (proceeding with teardown)",
+            where, static_cast<int>(result));
+    }
+}
+
 void FlushPendingDestroysBlocking()
 {
     std::vector<PendingDestroy> work;
@@ -1128,7 +1147,7 @@ void FlushPendingDestroysBlocking()
             const VkDevice device = destroy.context.instance.device;
             if (destroy.fence != VK_NULL_HANDLE)
             {
-                vk.WaitForFences(device, 1, &destroy.fence, VK_TRUE, std::numeric_limits<uint64_t>::max());
+                WaitFenceBounded(vk, device, destroy.fence, "FlushPendingDestroysBlocking");
                 vk.DestroyFence(device, destroy.fence, nullptr);
             }
             else if (destroy.context.instance.graphicsQueue != VK_NULL_HANDLE)
@@ -1518,7 +1537,7 @@ void DestroyAssemblyResourcesBlocking()
         const VkDevice device = assembly.context.instance.device;
         if (assembly.fence != VK_NULL_HANDLE)
         {
-            vk.WaitForFences(device, 1, &assembly.fence, VK_TRUE, std::numeric_limits<uint64_t>::max());
+            WaitFenceBounded(vk, device, assembly.fence, "DestroyAssemblyResourcesBlocking");
         }
         if (assembly.commandBuffer != VK_NULL_HANDLE && assembly.commandPool != VK_NULL_HANDLE)
             vk.FreeCommandBuffers(device, assembly.commandPool, 1, &assembly.commandBuffer);
@@ -2423,7 +2442,7 @@ NATIVE_TEXTURE_API void UNITY_INTERFACE_API Release(void* texPtr)
         const VkDevice device = upload.context.instance.device;
         if (upload.fence != VK_NULL_HANDLE)
         {
-            vk.WaitForFences(device, 1, &upload.fence, VK_TRUE, std::numeric_limits<uint64_t>::max());
+            WaitFenceBounded(vk, device, upload.fence, "Release/in-flight upload");
         }
         if (upload.commandBuffer != VK_NULL_HANDLE && upload.commandPool != VK_NULL_HANDLE)
             vk.FreeCommandBuffers(device, upload.commandPool, 1, &upload.commandBuffer);
@@ -2438,7 +2457,7 @@ NATIVE_TEXTURE_API void UNITY_INTERFACE_API Release(void* texPtr)
         const VkDevice device = assembly.context.instance.device;
         if (assembly.fence != VK_NULL_HANDLE)
         {
-            vk.WaitForFences(device, 1, &assembly.fence, VK_TRUE, std::numeric_limits<uint64_t>::max());
+            WaitFenceBounded(vk, device, assembly.fence, "Release/in-flight assembly");
         }
         if (assembly.commandBuffer != VK_NULL_HANDLE && assembly.commandPool != VK_NULL_HANDLE)
             vk.FreeCommandBuffers(device, assembly.commandPool, 1, &assembly.commandBuffer);
