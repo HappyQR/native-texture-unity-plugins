@@ -249,12 +249,12 @@ bool ExecuteQueueRequest(QueueRequestState& state,
 void UNITY_INTERFACE_API ReleaseTextureQueueCallback(int eventId, void* userData);
 void EnqueuePendingDestroy(const VulkanContext& context, const VulkanTextureResource& resource);
 void ProcessPendingDestroys();
-void FlushPendingDestroysBlocking();
+void FlushPendingDestroysBlocking(bool waitForGpu);
 void ReturnStagingSlotLocked(const StagingSlot& slot);
 void DestroyStagingSlotDirect(const VulkanContext& context, const StagingSlot& slot);
 void DrainCompletedAssembliesLocked();
 void SubmitPendingAssemblies();
-void DestroyAssemblyResourcesBlocking();
+void DestroyAssemblyResourcesBlocking(bool waitForGpu);
 
 struct ScopedStbiLoadFlip
 {
@@ -639,7 +639,12 @@ bool DestroyTextureResourceOnQueue(const VulkanContext& context,
     return true;
 }
 
-bool DestroyTextureResourceDirect(const VulkanTextureResource& resource, const char* operation)
+// waitForGpu=false is the device-shutdown path: vkQueueWaitIdle is unbounded and hangs
+// forever once the Android Surface is gone (the queued work is abandoned and never
+// retires), which is exactly the terminateNativeCode ANR. Unity raises kUnityGfxDevice-
+// EventShutdown after rendering has stopped and destroys the device right after, so
+// destroying without the barrier is safe there — and no later frame can observe it.
+bool DestroyTextureResourceDirect(const VulkanTextureResource& resource, const char* operation, bool waitForGpu)
 {
     const VulkanContext& context = resource.context;
     if (!context.valid || context.instance.device == VK_NULL_HANDLE)
@@ -652,7 +657,7 @@ bool DestroyTextureResourceDirect(const VulkanTextureResource& resource, const c
         return false;
     }
 
-    if (context.instance.graphicsQueue != VK_NULL_HANDLE && context.functions.QueueWaitIdle)
+    if (waitForGpu && context.instance.graphicsQueue != VK_NULL_HANDLE && context.functions.QueueWaitIdle)
     {
         const VkResult result = context.functions.QueueWaitIdle(context.instance.graphicsQueue);
         if (result != VK_SUCCESS)
@@ -678,7 +683,8 @@ bool DestroyTextureResourceDirect(const VulkanTextureResource& resource, const c
 
 void DestroyTextureResourceBestEffort(const VulkanTextureResource& resource,
                                       const VulkanContext* preferredContext,
-                                      const char* operation)
+                                      const char* operation,
+                                      bool waitForGpu)
 {
     bool destroyed = false;
     if (preferredContext && preferredContext->valid)
@@ -688,7 +694,7 @@ void DestroyTextureResourceBestEffort(const VulkanTextureResource& resource,
 
     if (!destroyed)
     {
-        destroyed = DestroyTextureResourceDirect(resource, operation);
+        destroyed = DestroyTextureResourceDirect(resource, operation, waitForGpu);
     }
 
     if (!destroyed)
@@ -701,7 +707,7 @@ void DestroyTextureResourceBestEffort(const VulkanTextureResource& resource,
     delete resource.externalImage;
 }
 
-void DrainOutstandingTextures(const char* operation, const VulkanContext* preferredContext)
+void DrainOutstandingTextures(const char* operation, const VulkanContext* preferredContext, bool waitForGpu)
 {
     std::vector<VulkanTextureResource> resources = TakeOutstandingTextureResources();
     if (resources.empty())
@@ -715,8 +721,30 @@ void DrainOutstandingTextures(const char* operation, const VulkanContext* prefer
 
     for (const VulkanTextureResource& resource : resources)
     {
-        DestroyTextureResourceBestEffort(resource, preferredContext, operation);
+        DestroyTextureResourceBestEffort(resource, preferredContext, operation, waitForGpu);
     }
+}
+
+// Counts of what the shutdown path still has to clean up. A healthy quit drains both to
+// zero before the device goes away (the app releases its pano handles and the render-thread
+// pump reaps them); non-zero means teardown is racing the GPU and is the signal to look at
+// the app-side quit ordering.
+void LogShutdownResidue()
+{
+    size_t textureCount = 0;
+    size_t pendingDestroyCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(gTextureMutex);
+        textureCount = gTextureResources.size();
+    }
+    {
+        std::lock_guard<std::mutex> lock(gUploadsMutex);
+        pendingDestroyCount = gPendingDestroys.size();
+    }
+
+    LogMessage("Info", "Graphics device shutdown residue: %zu texture(s), %zu pending destroy(s)",
+               textureCount,
+               pendingDestroyCount);
 }
 
 void UNITY_INTERFACE_API OnGraphicsDeviceEvent(UnityGfxDeviceEventType eventType)
@@ -730,12 +758,26 @@ void UNITY_INTERFACE_API OnGraphicsDeviceEvent(UnityGfxDeviceEventType eventType
             RefreshVulkanContextLocked();
             break;
         }
+        // Device reset keeps the process alive, so every destroy must still be GPU-ordered.
         case kUnityGfxDeviceEventBeforeReset:
+        {
+            FlushPendingDestroysBlocking(true);
+            DestroyAssemblyResourcesBlocking(true);
+            DrainOutstandingTextures("Graphics device reset", nullptr, true);
+
+            std::lock_guard<std::mutex> lock(gUnityStateMutex);
+            ClearVulkanInterfacesLocked();
+            break;
+        }
+        // Teardown: never block. Every wait here is unbounded and the Surface may already be
+        // gone, which is what trips the terminateNativeCode ANR watchdog.
         case kUnityGfxDeviceEventShutdown:
         {
-            FlushPendingDestroysBlocking();
-            DestroyAssemblyResourcesBlocking();
-            DrainOutstandingTextures("Graphics device shutdown", nullptr);
+            LogShutdownResidue();
+
+            FlushPendingDestroysBlocking(false);
+            DestroyAssemblyResourcesBlocking(false);
+            DrainOutstandingTextures("Graphics device shutdown", nullptr, false);
 
             std::lock_guard<std::mutex> lock(gUnityStateMutex);
             ClearVulkanInterfacesLocked();
@@ -1132,7 +1174,11 @@ void WaitFenceBounded(const VulkanFunctions& vk, VkDevice device, VkFence fence,
     }
 }
 
-void FlushPendingDestroysBlocking()
+// waitForGpu=false (device shutdown) skips both waits. The fence branch is merely bounded,
+// but the no-fence branch falls back to an UNBOUNDED vkQueueWaitIdle — and no-fence is the
+// common case at quit, because Release() enqueues with fence == VK_NULL_HANDLE and only the
+// render-thread pump arms it, which no longer runs once the app is tearing down.
+void FlushPendingDestroysBlocking(bool waitForGpu)
 {
     std::vector<PendingDestroy> work;
     {
@@ -1147,10 +1193,13 @@ void FlushPendingDestroysBlocking()
             const VkDevice device = destroy.context.instance.device;
             if (destroy.fence != VK_NULL_HANDLE)
             {
-                WaitFenceBounded(vk, device, destroy.fence, "FlushPendingDestroysBlocking");
+                if (waitForGpu)
+                {
+                    WaitFenceBounded(vk, device, destroy.fence, "FlushPendingDestroysBlocking");
+                }
                 vk.DestroyFence(device, destroy.fence, nullptr);
             }
-            else if (destroy.context.instance.graphicsQueue != VK_NULL_HANDLE)
+            else if (waitForGpu && destroy.context.instance.graphicsQueue != VK_NULL_HANDLE)
             {
                 vk.QueueWaitIdle(destroy.context.instance.graphicsQueue);
             }
@@ -1511,7 +1560,8 @@ void SubmitPendingAssemblies()
 // Shutdown / device-loss flush for assembly staging/command resources. The assembly
 // device images live in gTextureResources and are freed by DrainOutstandingTextures;
 // here we free the host stagings + any transient command pools/fences.
-void DestroyAssemblyResourcesBlocking()
+// waitForGpu=false (device shutdown) skips the fence wait — see FlushPendingDestroysBlocking.
+void DestroyAssemblyResourcesBlocking(bool waitForGpu)
 {
     std::vector<PendingAssembly> pending;
     std::vector<InFlightAssembly> inflight;
@@ -1535,7 +1585,7 @@ void DestroyAssemblyResourcesBlocking()
         if (!assembly.context.valid) continue;
         const VulkanFunctions& vk = assembly.context.functions;
         const VkDevice device = assembly.context.instance.device;
-        if (assembly.fence != VK_NULL_HANDLE)
+        if (waitForGpu && assembly.fence != VK_NULL_HANDLE)
         {
             WaitFenceBounded(vk, device, assembly.fence, "DestroyAssemblyResourcesBlocking");
         }
@@ -2488,7 +2538,7 @@ NATIVE_TEXTURE_API void UNITY_INTERFACE_API Release(void* texPtr)
     else
     {
         // No live Vulkan context (device tearing down) — best-effort direct destroy.
-        DestroyTextureResourceBestEffort(resource, nullptr, "Release");
+        DestroyTextureResourceBestEffort(resource, nullptr, "Release", true);
     }
 }
 
@@ -2537,16 +2587,17 @@ NATIVE_TEXTURE_API void UNITY_INTERFACE_API UnityPluginLoad(IUnityInterfaces* un
 NATIVE_TEXTURE_API void UNITY_INTERFACE_API UnityPluginUnload()
 {
     IUnityGraphics* unityGraphics = nullptr;
-    VulkanContext context = {};
     {
         std::lock_guard<std::mutex> lock(gUnityStateMutex);
         unityGraphics = gUnityGraphics;
-        context = gVulkanContext;
     }
 
-    FlushPendingDestroysBlocking();
-    DestroyAssemblyResourcesBlocking();
-    DrainOutstandingTextures("Plugin unload", context.valid ? &context : nullptr);
+    // Teardown, same rules as kUnityGfxDeviceEventShutdown: no blocking. preferredContext is
+    // deliberately nullptr — routing through DestroyTextureResourceOnQueue would hand the work
+    // to AccessQueue and then wait on a render thread that has already stopped.
+    FlushPendingDestroysBlocking(false);
+    DestroyAssemblyResourcesBlocking(false);
+    DrainOutstandingTextures("Plugin unload", nullptr, false);
 
     if (unityGraphics)
     {
