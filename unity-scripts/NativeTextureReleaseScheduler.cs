@@ -18,6 +18,12 @@ namespace NativeTexture
         // covers the 1-frame release defer + arm + reap; idle frames don't pump.
         private const int RenderPumpFrameWindow = 6;
 
+        // Ceiling on how long a worker thread waits for the main thread to run a release. Sized
+        // to only ever catch a main thread that has stopped pumping for good (teardown), never a
+        // main thread that is merely busy — an 8K pano upload frame is orders of magnitude below
+        // this, and timing out early would just return sooner, not skip the release.
+        private const int MainThreadDispatchTimeoutMs = 3000;
+
         private static readonly object s_sync = new object();
         private static readonly List<ScheduledRelease> s_pendingReleases = new List<ScheduledRelease>();
 
@@ -216,26 +222,48 @@ namespace NativeTexture
                     "NativeTexture release requires a captured Unity main-thread SynchronizationContext. Call NativeTexture.Initialize() from the main thread first.");
             }
 
+            // Bounded wait. An unbounded one deadlocks at teardown: the Unity main thread stops
+            // pumping its SynchronizationContext once the app is quitting, so a worker-thread
+            // Dispose (pano load continuations run with ConfigureAwait(false)) would block here
+            // forever and stall the shutdown — the terminateNativeCode ANR.
+            //
+            // Timing out does NOT abandon the work: the posted callback stays queued and still
+            // runs whenever the main thread resumes pumping, so a merely-slow frame releases the
+            // texture exactly as before. Only a main thread that never pumps again leaves it
+            // undone, and there the native shutdown path destroys the image anyway.
+            //
+            // Monitor rather than ManualResetEventSlim on purpose: nothing to dispose, so the
+            // callback can never touch a disposed handle after a timeout.
             Exception dispatchException = null;
-            using (var waitHandle = new ManualResetEventSlim(false))
-            {
-                mainThreadContext.Post(_ =>
-                {
-                    try
-                    {
-                        action();
-                    }
-                    catch (Exception ex)
-                    {
-                        dispatchException = ex;
-                    }
-                    finally
-                    {
-                        waitHandle.Set();
-                    }
-                }, null);
+            object completionGate = new object();
+            bool completed = false;
 
-                waitHandle.Wait();
+            mainThreadContext.Post(_ =>
+            {
+                try
+                {
+                    action();
+                }
+                catch (Exception ex)
+                {
+                    dispatchException = ex;
+                }
+                finally
+                {
+                    lock (completionGate)
+                    {
+                        completed = true;
+                        Monitor.Pulse(completionGate);
+                    }
+                }
+            }, null);
+
+            lock (completionGate)
+            {
+                if (!completed)
+                {
+                    Monitor.Wait(completionGate, MainThreadDispatchTimeoutMs);
+                }
             }
 
             if (dispatchException != null)
